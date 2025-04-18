@@ -62,3 +62,6 @@ CMakeUserPresets.json
 compile_commands.json
 *.bin
 .dir-locals.el
+
+# Docker
+!docker/common/nvshmem.patch
