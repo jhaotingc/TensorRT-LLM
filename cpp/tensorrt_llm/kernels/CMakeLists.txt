@@ -17,6 +17,7 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
+file(GLOB_RECURSE SRC_CUH *.cuh)
 
 # Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
 # selectiveScan trtllmGenKernels folder
@@ -35,6 +36,9 @@ list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "deepEpKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "deepEpKernels/.*")
+list(FILTER SRC_CUH EXCLUDE REGEX "deepEpKernels/.*")
 
 function(filter_cuda_archs ARCH SOURCES_VAR)
   if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -81,3 +85,4 @@ add_subdirectory(userbuffers)
 add_subdirectory(trtllmGenKernels)
 add_subdirectory(fusedLayernormKernels)
 add_subdirectory(groupRmsNormKernels)
+add_subdirectory(deepEpKernels)

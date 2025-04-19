@@ -183,6 +183,10 @@ set(TRTLLM_LINK_LIBS
     runtime_src
     testing_src
     userbuffers_src
+    intranode_cuda
+    runtime_cuda
+    internode_cuda
+    internode_ll_cuda
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
 
