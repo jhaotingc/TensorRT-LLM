@@ -189,6 +189,7 @@ else()
   endif()
 endif()
 
+
 set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
@@ -218,6 +219,10 @@ set(TRTLLM_LINK_LIBS
     layers_src
     runtime_src
     userbuffers_src
+    intranode_cuda
+    runtime_cuda
+    internode_cuda
+    internode_ll_cuda
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
 
