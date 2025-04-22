@@ -19,7 +19,6 @@ import pytest
 import torch
 # isort: on
 import os
-import torch.distributed as dist
 
 from parameterized import parameterized
 

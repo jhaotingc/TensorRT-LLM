@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
 
@@ -27,9 +26,9 @@ class Buffer:
 
     num_sms: int = 20
 
-    def __init__(self, group: dist.ProcessGroup,
+    def __init__(self, 
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 1) -> None:
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 1, rank: int = 0, group_size: int = 1) -> None:
         """
         Initialize the communication buffer.
 
@@ -43,50 +42,49 @@ class Buffer:
         """
 
         # Initialize the CPP runtime
-        self.rank = group.rank()
-        self.group_size = group.size()
-        self.group = group
+        self.rank = rank
+        self.group_size = group_size
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         print("self.rank", self.rank, "self.group_size", self.group_size, "num_nvl_bytes", num_nvl_bytes, "num_rdma_bytes", num_rdma_bytes, "low_latency_mode", low_latency_mode, "num_qps_per_rank", num_qps_per_rank)
         self.runtime = torch.classes.trtllm.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
 
-        # Synchronize device IDs
-        device_ids = [None, ] * self.group_size
-        local_device_id = self.runtime.get_local_device_id()
-        dist.all_gather_object(device_ids, local_device_id, group)
+        # # Synchronize device IDs
+        # device_ids = [None, ] * self.group_size
+        # local_device_id = self.runtime.get_local_device_id()
+        # dist.all_gather_object(device_ids, local_device_id, group)
 
-        # Synchronize IPC handles
-        ipc_handles = [None, ] * self.group_size
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
-        dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+        # # Synchronize IPC handles
+        # ipc_handles = [None, ] * self.group_size
+        # local_ipc_handle = self.runtime.get_local_ipc_handle()
+        # dist.all_gather_object(ipc_handles, local_ipc_handle, group)
 
-        # Synchronize NVSHMEM unique IDs
-        root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA for the low latency mode, which refers to "no package forwarding between NVLink and RDMA"
-            if low_latency_mode:
-                assert num_qps_per_rank > 0
-                os.environ['NVSHMEM_DISABLE_P2P'] = '1'
-                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-                os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
-                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
-                # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-                os.environ['NVSHMEM_QP_DEPTH'] = '1024'
-                # NOTES: NVSHMEM initialization requires at least 256 MiB
-                os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+        # # Synchronize NVSHMEM unique IDs
+        # root_unique_id = None
+        # if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+        #     # Enable IBGDA for the low latency mode, which refers to "no package forwarding between NVLink and RDMA"
+        #     if low_latency_mode:
+        #         assert num_qps_per_rank > 0
+        #         os.environ['NVSHMEM_DISABLE_P2P'] = '1'
+        #         os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+        #         os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
+        #         os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+        #         # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+        #         os.environ['NVSHMEM_QP_DEPTH'] = '1024'
+        #         # NOTES: NVSHMEM initialization requires at least 256 MiB
+        #         os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-            # Synchronize using the root ID
-            nvshmem_unique_ids = [None, ] * self.group_size
-            if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
-                root_unique_id = self.runtime.get_local_nvshmem_unique_id()
-            dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
-            root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
+        #     # Synchronize using the root ID
+        #     nvshmem_unique_ids = [None, ] * self.group_size
+        #     if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
+        #         root_unique_id = self.runtime.get_local_nvshmem_unique_id()
+        #     dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
+        #     root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
-        # Make CPP runtime available
-        self.runtime.sync(device_ids, ipc_handles, root_unique_id)
-        assert self.runtime.is_available()
+        # # Make CPP runtime available
+        # self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+        # assert self.runtime.is_available()
 
     # @staticmethod
     # def set_num_sms(new_num_sms: int) -> None:
@@ -554,11 +552,11 @@ class Buffer:
 
 @torch.library.custom_op("trtllm::deepep_buffer", mutates_args=())
 def deepep_buffer(
-    group: dist.ProcessGroup,
     num_ranks: int,
     num_nvl_bytes: int,
     num_rdma_bytes: int,
     low_latency_mode: bool,
-) -> Buffer:
+) -> int:
 
-    return Buffer(group, num_ranks, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
+    buffer = Buffer(num_nvl_bytes, num_rdma_bytes, low_latency_mode, num_qps_per_rank, rank, group_size)
+    return 0
