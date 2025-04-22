@@ -39,11 +39,6 @@ add_library(nvshmem_device ALIAS nvshmem::nvshmem_device)
 function(add_deep_ep_library target_name source_file)
     add_library(${target_name} STATIC ${source_file})
     set_target_properties(${target_name} PROPERTIES
-            POSITION_INDEPENDENT_CODE ON
-            CXX_STANDARD_REQUIRED ON
-            CUDA_STANDARD_REQUIRED ON
-            CXX_STANDARD 14
-            CUDA_STANDARD 14
             CUDA_SEPARABLE_COMPILATION ON
             POSITION_INDEPENDENT_CODE ON
             CUDA_RESOLVE_DEVICE_SYMBOLS ON

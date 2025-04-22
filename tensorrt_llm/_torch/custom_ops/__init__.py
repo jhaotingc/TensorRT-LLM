@@ -2,6 +2,7 @@ from .cpp_custom_ops import _register_fake
 from .flashinfer_custom_ops import IS_FLASHINFER_AVAIABLE
 from .torch_custom_ops import bmm_out
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
+from .deepep_custom_ops import deepep_buffer
 
 __all__ = [
     'IS_FLASHINFER_AVAIABLE',
@@ -10,6 +11,7 @@ __all__ = [
     'add_to_ub',
     'copy_to_userbuffers',
     'matmul_to_ub',
+    'deepep_buffer',
 ]
 
 if IS_FLASHINFER_AVAIABLE:

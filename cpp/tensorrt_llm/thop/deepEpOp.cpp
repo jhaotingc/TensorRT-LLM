@@ -123,7 +123,7 @@ bool Buffer::is_available() const {
 
 } // namespace torch_ext
 
-TORCH_LIBRARY(trtllm, m)
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::Buffer>("Buffer")
         .def(torch::init<int64_t, int64_t, int64_t, int64_t, bool>())
