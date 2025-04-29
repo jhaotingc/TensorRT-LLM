@@ -1,0 +1,10 @@
+speculative_config:
+  eagle_choices: null
+  decoding_type: Eagle
+  greedy_sampling: false
+  num_eagle_layers: 4
+  max_non_leaves_per_layer: 10
+  max_draft_len: 63
+  pytorch_eagle_weights_path: null
+  use_dynamic_tree: true
+  dynamic_tree_max_top_k: 10
