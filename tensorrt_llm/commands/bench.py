@@ -54,7 +54,7 @@ def main(
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)
 
 
-main.add_command(build_command)
+# main.add_command(build_command)
 main.add_command(throughput_command)
 main.add_command(latency_command)
 

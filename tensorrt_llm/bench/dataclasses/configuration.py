@@ -21,6 +21,7 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 SPECULATIVE_MAP = {
     SpeculativeDecodingMode.NONE: lambda *args: None,
     SpeculativeDecodingMode.MEDUSA: trtllm.DecodingMode.Medusa,
+    SpeculativeDecodingMode.EAGLE: trtllm.DecodingMode.Eagle,
 }
 
 
@@ -39,6 +40,7 @@ class RuntimeConfig(BaseModel):
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
+        print("self.extra_llm_api_options", self.extra_llm_api_options)
 
         llm_args = {
             "scheduler_config":
@@ -120,6 +122,13 @@ class PerformanceOptions:
 class DecodingConfig(BaseModel):
     medusa_choices: Optional[List[List[int]]] = None
     decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
+    num_eagle_layers: Optional[int] = None
+    max_non_leaves_per_layer: Optional[int] = None
+    max_draft_len: Optional[int] = None
+    greedy_sampling: Optional[bool] = None
+    eagle_choices: Optional[List[List[int]]] = None
+    use_dynamic_tree: Optional[bool] = None
+    dynamic_tree_max_topK: Optional[int] = None
 
     @field_validator("decoding_mode")
     @classmethod
@@ -143,6 +152,20 @@ class DecodingConfig(BaseModel):
 
         if self.medusa_choices is not None:
             kwargs["medusa_choices"] = self.medusa_choices
+        if self.num_eagle_layers is not None:
+            kwargs["num_eagle_layers"] = self.num_eagle_layers
+        if self.max_non_leaves_per_layer is not None:
+            kwargs["max_non_leaves_per_layer"] = self.max_non_leaves_per_layer
+        if self.max_draft_len is not None:
+            kwargs["max_draft_len"] = self.max_draft_len
+        if self.greedy_sampling is not None:
+            kwargs["greedy_sampling"] = self.greedy_sampling
+        if self.eagle_choices is not None:
+            kwargs["eagle_choices"] = self.eagle_choices
+        if self.use_dynamic_tree is not None:
+            kwargs["use_dynamic_tree"] = self.use_dynamic_tree
+        if self.dynamic_tree_max_topK is not None:
+            kwargs["dynamic_tree_max_topK"] = self.dynamic_tree_max_topK
 
         return trtllm.DecodingConfig(**kwargs)
 

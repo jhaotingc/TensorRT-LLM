@@ -270,10 +270,12 @@ def throughput_command(
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
+
     llm = None
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
+        print("kwargs", kwargs)
         kwargs['backend'] = backend
 
         if "pytorch_backend_config" in kwargs and iteration_log is not None:

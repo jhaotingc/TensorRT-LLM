@@ -366,8 +366,13 @@ class ReportUtility:
                 and self.rt_cfg.decoding_config.decoding_mode
                 != SpeculativeDecodingMode.NONE):
             # cpp decoding
+            print("self.rt_cfg.decoding_config.decoding_mode", self.rt_cfg.decoding_config.decoding_mode)
+            print("self.rt_cfg.decoding_config.decoding_mode is eagle", self.rt_cfg.decoding_config.decoding_mode == SpeculativeDecodingMode.EAGLE)
             spec_decoding = True
-            decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
+            if self.rt_cfg.decoding_config.decoding_mode == SpeculativeDecodingMode.EAGLE:
+                decoding_mode = "eagle"
+            else:
+                decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
         elif ("speculative_config" in self.kwargs
               and self.kwargs["speculative_config"] is not None):
             # pytorch speculative decoding
