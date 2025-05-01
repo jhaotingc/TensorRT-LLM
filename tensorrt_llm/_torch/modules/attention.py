@@ -53,7 +53,7 @@ class Attention(nn.Module):
         if dense_bias is None:
             self.dense_bias = bias
 
-        if (self.head_dim * self.num_heads) != self.hidden_size and config.pretrained_config.model_type != 'qwen3':
+        if (self.head_dim * self.num_heads) != self.hidden_size and not config.pretrained_config.model_type.startswith('qwen3'):
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads}).")
