@@ -30,7 +30,7 @@
 # set_property(TARGET deep_ep_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 # set_property(TARGET deep_ep_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-find_package(NVSHMEM REQUIRED HINTS ${NVSHMEM_ROOT_DIR}/lib/cmake/nvshmem)
+find_package(NVSHMEM REQUIRED HINTS ${NVSHMEM_DIR}/lib/cmake/nvshmem)
 
 add_library(nvshmem ALIAS nvshmem::nvshmem)
 add_library(nvshmem_host ALIAS nvshmem::nvshmem_host)
@@ -38,7 +38,7 @@ add_library(nvshmem_device ALIAS nvshmem::nvshmem_device)
 
 function(add_deep_ep_library target_name source_file)
     add_library(${target_name} STATIC ${source_file})
-    set_target_properties(${target_name} PROPERTIES
+    set_target_properties(${target_name} PROPERTIES 
             CUDA_SEPARABLE_COMPILATION ON
             POSITION_INDEPENDENT_CODE ON
             CUDA_RESOLVE_DEVICE_SYMBOLS ON
