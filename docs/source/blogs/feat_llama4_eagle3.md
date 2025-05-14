@@ -1,4 +1,4 @@
-# How to run Llama4 Maverick + Eagle3 with feat/llama4
+# How to launch Llama4 Maverick + Eagle3 trtllm server with feat/llama4
 
 1. Git clone, checkout to branch `feat/llama4`
 ```
