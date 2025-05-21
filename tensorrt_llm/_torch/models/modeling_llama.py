@@ -992,9 +992,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-        self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                            dtype=torch.int64),
-                                requires_grad=False)
+        if config.vocab_size != config.draft_vocab_size:
+            self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
+                                                dtype=torch.int64),
+                                    requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
             self.embed_tokens = Embedding(
