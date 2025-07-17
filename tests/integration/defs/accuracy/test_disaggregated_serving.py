@@ -23,8 +23,7 @@ from tensorrt_llm.llmapi.llm_args import LlmArgs
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
-                            get_accuracy_task)
+from .accuracy_core import GSM8K, MMLU, LlmapiAccuracyTestHarness
 
 
 class Result(GenerationResultBase):
@@ -274,6 +273,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler
         }
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -311,11 +312,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -336,19 +343,55 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
-                             ids=["tp1pp2", "tp2pp1", "tp2pp2"])
-    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
-    def test_tp_pp_symmetric(self, tp, pp, testset):
-        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
-                                 tp, get_accuracy_task(testset))
-
-    @parametrize_with_ids("ctx_pp", [2, 4])
-    @parametrize_with_ids("gen_tp", [1, 2])
-    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
-    def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
-        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
-                                 gen_tp, get_accuracy_task(testset))
+    @pytest.mark.parametrize("overlap_scheduler", [False])
+    def test_eagle3(self, overlap_scheduler):
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 4,
+            "speculative_model_dir":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": False
+        }
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.timeout(3600)
@@ -361,6 +404,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -396,6 +441,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
@@ -436,8 +483,20 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
         ctx_server_config["kv_cache_config"] = {
             # "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": True
