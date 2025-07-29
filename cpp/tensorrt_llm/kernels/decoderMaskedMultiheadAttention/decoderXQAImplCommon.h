@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
 #include <cstddef>
@@ -67,6 +68,7 @@ struct XQAKernelRuntimeHashKey
     bool paged_kv_cache;
     bool multi_query_tokens;
     bool is_fp8_output;
+    bool rope_in_xqa;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -74,7 +76,7 @@ struct XQAKernelRuntimeHashKey
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
-            && is_fp8_output == other.is_fp8_output;
+            && is_fp8_output == other.is_fp8_output && rope_in_xqa == other.rope_in_xqa;
     }
 };
 
@@ -103,6 +105,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.multi_query_tokens;
         key <<= 1;  // 51
         key ^= s.is_fp8_output;
+        key <<= 1;  // 52
+        key ^= s.rope_in_xqa;
         return key;
     }
 };

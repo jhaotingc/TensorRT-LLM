@@ -97,7 +97,7 @@ public:
             }
             XQAKernelRuntimeHashKey hash_key{kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth,
                 kernelMeta.mNumQHeadsOverKV, kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache,
-                kernelMeta.mMultiQueryTokens, 0 /* xqa jit param is_fp8_output */};
+                kernelMeta.mMultiQueryTokens, 0 /* xqa jit param is_fp8_output */, 0 /* xqa jit param rope_in_xqa*/};
 
             mFunctions.insert(std::make_pair(hash_key, funcInfo));
         }
@@ -124,10 +124,15 @@ public:
             m_tilesize = num_q_heads_over_kv;
         }
 
+        bool const rope_in_xqa = !xqaParams.multi_query_tokens
+            && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
+                                                PositionEmbeddingType::kROPE_GPTJ},
+                xqaParams.position_embedding_type);
+
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
                 xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, xqaParams.is_fp8_output};
+                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, xqaParams.is_fp8_output, rope_in_xqa};
         auto const findIter = mFunctions.find(hash_key);
         return findIter != mFunctions.end();
     }

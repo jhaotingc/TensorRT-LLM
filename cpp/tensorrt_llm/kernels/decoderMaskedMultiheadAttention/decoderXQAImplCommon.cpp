@@ -52,9 +52,15 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     unsigned int kernel_m_tilesize
         = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit);
 
+    // additional check for ropestyle if there is ropestyle change between layers
+    bool const rope_in_xqa = !xqaParams.multi_query_tokens
+        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
+                                              PositionEmbeddingType::kROPE_GPTJ},
+            xqaParams.position_embedding_type);
+
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
-        xqaParams.multi_query_tokens, xqaParams.is_fp8_output};
+        xqaParams.multi_query_tokens, xqaParams.is_fp8_output, rope_in_xqa};
 }
 
 } // namespace tensorrt_llm::kernels

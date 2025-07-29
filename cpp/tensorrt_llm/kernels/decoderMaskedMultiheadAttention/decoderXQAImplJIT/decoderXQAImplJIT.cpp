@@ -38,7 +38,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const&
 {
     return {kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth, kernelMeta.mNumQHeadsOverKV,
         kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens,
-        0 /* xqa jit param is_fp8_output */};
+        0 /* xqa jit param is_fp8_output */, 0 /* xqa jit param rope_in_xqa*/};
 }
 
 } // anonymous namespace
