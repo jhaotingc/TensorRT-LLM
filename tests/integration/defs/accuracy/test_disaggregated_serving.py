@@ -23,7 +23,8 @@ from tensorrt_llm.llmapi.llm_args import LlmArgs
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import GSM8K, MMLU, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
+                            get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -392,6 +393,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
+                             ids=["tp1pp2", "tp2pp1", "tp2pp2"])
+    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
+    def test_tp_pp_symmetric(self, tp, pp, testset):
+        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
+                                 tp, get_accuracy_task(testset))
+
+    @parametrize_with_ids("ctx_pp", [2, 4])
+    @parametrize_with_ids("gen_tp", [1, 2])
+    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
+    def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
+        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
+                                 gen_tp, get_accuracy_task(testset))
 
 
 @pytest.mark.timeout(3600)

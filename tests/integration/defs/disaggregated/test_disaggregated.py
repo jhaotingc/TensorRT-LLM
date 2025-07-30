@@ -59,6 +59,16 @@ def get_test_config(test_desc, example_dir, test_root):
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
         "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
+        "ctxpp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml"),
+        "ctxtp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxtp2_genpp2.yaml"),
+        "ctxpp2_gentp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_gentp2.yaml"),
+        "ctxtp2pp2_gentp2pp2":
+        (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
+        "ctxpp4_genpp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
