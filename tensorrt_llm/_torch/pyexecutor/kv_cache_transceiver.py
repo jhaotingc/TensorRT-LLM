@@ -83,13 +83,13 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig):
         world_config = mapping_to_world_config(mapping)
-        num_kv_heads_per_layer = kv_cache_manager.num_kv_heads_per_layer
+        total_num_kv_heads_per_layer = kv_cache_manager.total_num_kv_heads_per_layer
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
 
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl, comm_type,
-                                        num_kv_heads_per_layer, head_dim,
+        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
+                                        total_num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config, dtype,
                                         attention_type,
                                         cache_transceiver_config)
