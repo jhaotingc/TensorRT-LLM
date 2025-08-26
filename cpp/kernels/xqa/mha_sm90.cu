@@ -630,6 +630,8 @@ CUBIN_EXPORT __global__
 #ifdef NDEBUG
 #if !OPTIMIZE_FOR_LATENCY
     __launch_bounds__(128 * 3, headElems* ctaNbQHeads <= 128 * 16 ? 3 : 2)
+#else
+    __launch_bounds__(128 * 3)
 #endif
 #else
     __launch_bounds__(128 * 3, 1)
@@ -999,7 +1001,7 @@ CUBIN_EXPORT __global__
         if (threadIdx.x < smem.gemm1AccColMax.size)
         {
             auto const idx = threadIdx.x;
-            smem.gemm1AccColMax[idx] = mha::numeric_limits<float>::lowest();
+            smem.gemm1AccColMax[idx] = safeInitRowMax;
             smem.gemm1AccColSum[idx] = 0;
         }
         smem.gemm1WarpGrpBar.arrive_and_wait();
@@ -1073,6 +1075,23 @@ CUBIN_EXPORT __global__
                     }
                     printf("\n\n");
                 }
+            }
+            smem.gemm1WarpGrpBar.arrive_and_wait();
+#else
+            if (blockIdx.y == 1 && threadIdx.x == 0)
+            {
+                printf("rowMax:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowMax[idxXBuf][i]);
+                }
+                printf("\n");
+                printf("rowSum:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowSum[idxXBuf][i]);
+                }
+                printf("\n");
             }
             smem.gemm1WarpGrpBar.arrive_and_wait();
 #endif
@@ -1887,7 +1906,7 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
                     uint32_t const globalRow = tileStartRow + row;
                     if (globalRow >= cacheSeqLen)
                     {
-                        acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                        acc(m, n)(i, j) = safeInitRowMax;
                         continue;
                     }
                     if (globalRow >= maskStartRow)
@@ -1895,7 +1914,7 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
                         uint32_t const maskRow = globalRow - maskStartRow;
                         if ((bit_mask >> maskRow) == 0)
                         {
-                            acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                            acc(m, n)(i, j) = safeInitRowMax;
                         }
                     }
                 }
@@ -2009,7 +2028,7 @@ __device__ inline void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32
 #pragma unroll
                 for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
                 {
-                    acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                    acc(m, n)(i, j) = safeInitRowMax;
                 }
             }
         }
@@ -2302,9 +2321,9 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
                 {
                     uint32_t const col = GmmaAccCoreMat::cols * (4 * n + idxInQuad) + j;
                     assert((col < nbValidCols) == bool(endMask & (1ULL << col)));
-                    if (((mask >> col) & 1) == 0)
+                    if ((mask & (1ULL << col)) == 0)
                     {
-                        acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                        acc(m, n)(i, j) = safeInitRowMax;
                     }
                 }
             }
@@ -2332,7 +2351,7 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, uint32_t validColBeg, uin
 #pragma unroll
                 for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
                 {
-                    acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                    acc(m, n)(i, j) = safeInitRowMax;
                 }
             }
         }
