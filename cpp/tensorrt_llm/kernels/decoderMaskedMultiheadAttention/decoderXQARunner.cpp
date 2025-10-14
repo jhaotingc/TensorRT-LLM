@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
@@ -35,6 +36,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+using tensorrt_llm::common::contains;
+
 
 DecoderXQARunner::DecoderXQARunner(
     const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode)
@@ -90,7 +94,7 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
             // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
             // now.
             bool const supportedByHopperXqa
-                = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && grpSize <= 64);
+                = (smVersion == 90 && contains({DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_E4M3}, xqaParams.kv_cache_data_type) && grpSize <= 64);
             bool const supportedBySm120Mla = (smVersion == 120 && xqaParams.isMLA()
                 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
             bool const supportedByAmpereXqa = (!xqaParams.isMLA() && (64 % grpSize == 0));

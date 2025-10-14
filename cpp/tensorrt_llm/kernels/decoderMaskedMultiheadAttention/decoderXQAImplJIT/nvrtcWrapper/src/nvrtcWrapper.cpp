@@ -223,7 +223,7 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         result->push_back(getMacroFlag(macro.first, macro.second));
     }
 
-#ifndef NDEBUG
+// #ifndef NDEBUG
     std::stringstream ss;
     ss << "XQA Macros: ";
     for (auto const& [k, v] : macros)
@@ -231,7 +231,7 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         ss << k << "=" << v << " ";
     }
     puts(ss.str().c_str());
-#endif
+// #endif
 
     return TLLM_XQA_JIT_SUCCESS;
 }
@@ -287,7 +287,14 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
         ? tensorrt_llm::kernels::mla_sm120_cu_content
         : (context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
                                                       : tensorrt_llm::kernels::mha_cu_content);
-
+    if (context->kernel_type == TLLM_XQA_JIT_QGMMA) {
+        printf("[nvrtcWrapper.cpp] TLLM_XQA_JIT_QGMMA\n");
+    } else if (context->kernel_type == TLLM_XQA_JIT_MLA) {
+        printf("[nvrtcWrapper.cpp] TLLM_XQA_JIT_MLA\n");
+    } else
+    {
+        printf("[nvrtcWrapper.cpp] HQMMA\n");
+    }
     std::vector<char const*> headers_content, headers_name;
     for (auto x : tensorrt_llm::kernels::xqa_headers_content)
         headers_content.push_back(x);

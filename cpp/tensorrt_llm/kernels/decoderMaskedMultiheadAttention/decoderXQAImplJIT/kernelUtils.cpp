@@ -95,7 +95,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    if (!((contains({DATA_TYPE_FP16, DATA_TYPE_BF16}, xqaParams.kv_cache_data_type) && xqaParams.multi_query_tokens) || xqaParams.kv_cache_data_type == DATA_TYPE_E4M3))
     {
         return false;
     }
