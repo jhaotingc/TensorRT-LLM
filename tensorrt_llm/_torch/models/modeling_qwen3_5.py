@@ -653,6 +653,48 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+def _normalize_compressed_tensors_names(
+    weights: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Rename llm-compressor (compressed-tensors) NVFP4 tensors to the ModelOpt
+    names the MoE / Linear NVFP4 loaders expect.
+
+    compressed-tensors stores an NVFP4 Linear as:
+        weight_packed, weight_scale, weight_global_scale, input_global_scale
+    ModelOpt (NVIDIA Qwen3.6-NVFP4) stores it as:
+        weight,        weight_scale, weight_scale_2,      input_scale
+    (weight_scale -- the per-group FP8 scale -- is already identical.)
+
+    Guarded on the presence of a "*.weight_packed" key so ModelOpt checkpoints
+    pass through untouched (they never contain weight_packed).
+    """
+    if not any(k.endswith(".weight_packed") for k in weights):
+        return weights
+    # weight_scale (per-group FP8) is byte-identical between the two formats and
+    # keeps its name. The two *global* FP32 scalars are reciprocals, though:
+    # compressed-tensors stores a *quantization* scale (amax -> FP4*FP8 range),
+    # ModelOpt stores the *dequantization* scale. Invert them on rename.
+    #   weight_global_scale -> weight_scale_2 = 1 / weight_global_scale
+    #   input_global_scale  -> input_scale    = 1 / input_global_scale
+    invert = {
+        ".weight_global_scale": ".weight_scale_2",
+        ".input_global_scale": ".input_scale",
+    }
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in weights.items():
+        renamed = False
+        for old_suffix, new_suffix in invert.items():
+            if k.endswith(old_suffix):
+                k = k[: -len(old_suffix)] + new_suffix
+                v = (1.0 / v.float()).to(v.dtype)
+                renamed = True
+                break
+        if not renamed and k.endswith(".weight_packed"):
+            k = k[: -len(".weight_packed")] + ".weight"
+        out[k] = v
+    return out
+
+
 class _Qwen3_5VLModel(Qwen3VLModelBase):
     """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
     (Qwen3Next-based) text decoder.
@@ -697,6 +739,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         weight_mapper = Qwen3_5MoeHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        filtered_weights = _normalize_compressed_tensors_names(filtered_weights)
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",
         }
