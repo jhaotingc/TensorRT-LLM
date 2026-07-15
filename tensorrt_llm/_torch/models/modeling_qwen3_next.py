@@ -719,7 +719,8 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         # user-selected backend.
         mtp_model_config = model_config
         if (model_config.moe_backend != "CUTLASS"
-                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)):
+                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)
+                and not Qwen3NextMTP._mtp_bf16_trtllmgen_ok(model_config)):
             original_backend = model_config.moe_backend
             mtp_model_config = copy.copy(model_config)
             mtp_model_config._frozen = False
@@ -777,6 +778,24 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 use_cute_dsl_blockscaling_mm=False,
             )
         self.shared_head = Qwen3NextMTPHead(mtp_model_config)
+
+    @staticmethod
+    def _mtp_bf16_trtllmgen_ok(
+            model_config: ModelConfig[Qwen3NextConfig]) -> bool:
+        """An unquantized (BF16) MTP MoE can run on the TRTLLM-Gen backend
+        via FlashInfer's trtllm_bf16_moe kernel (same path vLLM uses), so we
+        should NOT force the CUTLASS fallback when: the user requested the
+        TRTLLM backend and that FlashInfer BF16 path is available. get_moe_cls
+        then dispatches BF16 -> TRTLLMGenFusedMoE automatically.
+        """
+        if model_config.moe_backend.upper() != "TRTLLM":
+            return False
+        try:
+            from ..modules.fused_moe.fused_moe_trtllm_gen import (
+                TRTLLMGenFusedMoE)
+            return TRTLLMGenFusedMoE._is_flashinfer_fused_moe_available()
+        except Exception:
+            return False
 
     @staticmethod
     def _is_mtp_excluded_from_quant(

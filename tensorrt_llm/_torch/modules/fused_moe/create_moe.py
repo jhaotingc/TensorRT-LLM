@@ -217,7 +217,17 @@ def resolve_moe_cls(
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))
     if (moe_cls == TRTLLMGenFusedMoE and not has_quant):
-        moe_cls = CutlassFusedMoE
+        # TRTLLMGenFusedMoE now has an unquantized BF16 path via FlashInfer
+        # (trtllm_bf16_moe); only downgrade to CUTLASS when that path is
+        # unavailable. Without this, unquantized layers (e.g. an MTP draft
+        # layer excluded from quant) get force-demoted to CutlassFusedMoE even
+        # though TRTLLMGen._get_quant_method would select BF16TRTLLMGenFusedMoEMethod.
+        _bf16_trtllmgen_ok = (
+            getattr(model_config.pretrained_config, "torch_dtype", None)
+            == torch.bfloat16
+            and TRTLLMGenFusedMoE._is_flashinfer_fused_moe_available())
+        if not _bf16_trtllmgen_ok:
+            moe_cls = CutlassFusedMoE
 
     # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized
     # base weights. Fail loudly here rather than at runtime if the user-selected
