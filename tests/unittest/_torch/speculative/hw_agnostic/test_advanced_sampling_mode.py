@@ -19,11 +19,16 @@ mode resolution, a CUDA check that NO_TOPK yields the same distribution as FULL
 when top_k is disabled, and native greedy handling (greedy rows return argmax).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
 
 
@@ -152,6 +157,48 @@ def test_advanced_mode_accepted_on_all_spec_paths():
         ),
     )
     assert args.speculative_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
+
+
+@pytest.mark.parametrize(
+    "repetition_penalty, expected_all_greedy",
+    [(1.0, True), (1.1, False)],
+)
+def test_repetition_penalty_selects_advanced_graph(repetition_penalty, expected_all_greedy):
+    metadata = SpecMetadata(
+        max_num_requests=1,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+    )
+    metadata.runtime_draft_len = 3
+    request = SimpleNamespace(
+        sampling_config=SimpleNamespace(
+            temperature=None,
+            top_k=None,
+            top_p=None,
+            repetition_penalty=[repetition_penalty],
+        ),
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_seq_slot=0,
+    )
+
+    normalized, slots = metadata._scan_one_model_sampling([request])
+
+    assert metadata.is_all_greedy_sample is expected_all_greedy
+    assert normalized[0][-1] == repetition_penalty
+    assert slots == [0]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_repetition_penalty_admission_is_limited_to_supported_modes(supported):
+    sampler = object.__new__(SpecSampler)
+    sampler.supports_repetition_penalty = supported
+    request = SimpleNamespace(sampling_config=SimpleNamespace(min_p=None, repetition_penalty=[1.1]))
+
+    if supported:
+        sampler.validate_request(request)
+    else:
+        with pytest.raises(ValueError, match="vanilla MTP and DFlash"):
+            sampler.validate_request(request)
 
 
 if __name__ == "__main__":

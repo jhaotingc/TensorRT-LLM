@@ -108,6 +108,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "min_p is not supported with one-model speculative decoding. "
                 "Drop min_p from the request, or disable speculative decoding."
             )
+        repetition_penalty = sampling_config.repetition_penalty
+        if (
+            repetition_penalty
+            and repetition_penalty[0] != 1.0
+            and not self.supports_repetition_penalty
+        ):
+            raise ValueError(
+                "repetition_penalty is currently supported only by linear "
+                "vanilla MTP and DFlash one-model speculative decoding."
+            )
 
     @dataclass(kw_only=True)
     class Store:
@@ -118,7 +128,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
+    def __init__(
+        self,
+        args: TorchSampler.Args,
+        *,
+        accepted_path_len: Optional[int] = None,
+        supports_repetition_penalty: bool = False,
+    ):
         """
         Initialize the speculative sampler.
 
@@ -128,8 +144,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 can accept, used to size new_tokens. Defaults to
                 ``args.max_draft_len + 1``; see the store comment below for the
                 one mode that has to override it.
+            supports_repetition_penalty: Whether this mode implements target-side
+                repetition penalty in its speculative acceptance path.
         """
         self._async_worker_init(args.enable_async_worker)
+        self.supports_repetition_penalty = supports_repetition_penalty
         self.mapping = None
         self.max_seq_len = args.max_seq_len
         # Wire width minus one: the number of draft slots the target verifies

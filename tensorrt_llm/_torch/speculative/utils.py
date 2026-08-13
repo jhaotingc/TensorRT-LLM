@@ -123,6 +123,8 @@ def get_spec_metadata(spec_config,
             use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
+        supports_repetition_penalty = not getattr(
+            spec_config, "use_relaxed_acceptance_for_thinking", False)
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -131,7 +133,10 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             use_rejection_sampling=use_rejection_sampling,
+            supports_repetition_penalty=supports_repetition_penalty,
+            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
+            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
@@ -209,8 +214,10 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
+            supports_repetition_penalty=True,
             advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
+            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_dspark():
@@ -414,7 +421,15 @@ def get_spec_decoder(
         accepted_path_len = None
         if getattr(spec_config, "eagle_choices", None):
             accepted_path_len = sampler_args.max_total_draft_tokens + 1
-        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
+        supports_repetition_penalty = (
+            spec_dec_mode.is_dflash()
+            or spec_dec_mode.is_mtp_vanilla() and not getattr(
+                spec_config, "use_relaxed_acceptance_for_thinking", False))
+        return SpecSampler(
+            sampler_args,
+            accepted_path_len=accepted_path_len,
+            supports_repetition_penalty=supports_repetition_penalty,
+        )
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

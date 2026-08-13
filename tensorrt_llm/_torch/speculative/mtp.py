@@ -815,17 +815,10 @@ class MTPWorker(SpecWorkerBase):
                 runtime_draft_len,
                 spec_metadata=spec_metadata)
 
-        # Rejection sampling acceptance. _can_use_rejection_sampling() requires
-        # use_rejection_sampling and a non-all-greedy batch; otherwise falls
-        # through to strict acceptance below. Context rows take the target's
-        # first sampled token; gen rows run the rejection kernel.
-        elif self._can_use_rejection_sampling(spec_metadata):
-            draft_tokens = spec_metadata.draft_tokens.reshape(
-                num_gens, runtime_draft_len)
-            accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
-                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
-
-        # Strict acceptance
+        # The legacy THOP path is strict-only and does not support advanced
+        # sampling. All Python strict/rejection acceptance goes through the
+        # shared helper so target-logit transforms and accepted-token history
+        # updates cannot diverge between the two algorithms.
         else:
             if self.is_thop:
                 # Temporary buffer
@@ -845,12 +838,9 @@ class MTPWorker(SpecWorkerBase):
                     runtime_draft_len,
                     spec_metadata=spec_metadata)
             else:
-                # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
                     num_gens, runtime_draft_len)
-
-                # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 

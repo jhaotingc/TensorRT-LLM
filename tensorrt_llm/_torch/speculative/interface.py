@@ -48,6 +48,10 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .repetition_penalty import (OneModelRepetitionPenaltyState,
+                                 apply_linear_spec_repetition_penalty,
+                                 commit_linear_spec_seen_tokens,
+                                 get_repetition_penalty)
 
 
 def rejection_sampling_one_model(
@@ -593,6 +597,9 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Whether this linear one-model mode supports target-side repetition
+    # penalty. Currently enabled only for vanilla MTP and DFlash.
+    supports_repetition_penalty: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Sampling parameters for non-greedy sampling (per-request)
@@ -656,6 +663,9 @@ class SpecMetadata:
     # Used to scatter draft probs by slot at write time and gather them by slot
     # at the next iter's verify. Shape: [max_num_requests], dtype=long.
     batch_slot_ids: Optional[torch.Tensor] = None
+    # Persistent target-side repetition history. This object is deliberately
+    # shared by eager and CUDA-graph metadata shallow copies.
+    repetition_state: Optional[OneModelRepetitionPenaltyState] = None
     # Draft probs expanded to the target vocab size. Zero-filled once at
     # prepare(); each rejection iter overwrites only the d2t-selected positions
     # (or [:draft_vocab] when there is no d2t).
@@ -667,6 +677,22 @@ class SpecMetadata:
 
     def __post_init__(self):
         pass
+
+    def prepare_linear_repetition_penalty_buffers(self):
+        """Allocate graph-stable buffers for linear one-model speculation."""
+        if self.repetition_state is None:
+            assert self.vocab_size > 0
+            self.repetition_state = OneModelRepetitionPenaltyState.create(
+                max_num_requests=self.max_num_requests,
+                num_seq_slots=self.num_seq_slots,
+                vocab_size=self.vocab_size,
+                device="cuda",
+            )
+            self.dummy_slot_row = self.repetition_state.dummy_slot_row
+        if self.batch_slot_ids is None and self.max_num_requests > 0:
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device="cuda")
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -746,6 +772,8 @@ class SpecMetadata:
         Hook to be called before the forward step of the model.
         """
         self.prepare_rejection_sampling_buffers()
+        if self.supports_repetition_penalty:
+            self.prepare_linear_repetition_penalty_buffers()
 
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
@@ -781,7 +809,7 @@ class SpecMetadata:
 
     def _scan_one_model_sampling(
         self, requests: list["LlmRequest"]
-    ) -> tuple[list[tuple[float, int, float, int]], list[int]]:
+    ) -> tuple[list[tuple[float, int, float, int, float]], list[int]]:
         """Single source of truth for one-engine sampling-param detection.
 
         Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
@@ -846,8 +874,8 @@ class SpecMetadata:
             )
 
         # Phase 1: collect per-request flags and normalized values.
-        per_request_normalized: list[tuple[float, int, float, int]] = []
-        has_non_greedy_requests = False
+        per_request_normalized: list[tuple[float, int, float, int, float]] = []
+        has_advanced_sampling_requests = False
         per_request_slot_ids: list[int] = []
 
         for request in requests:
@@ -855,6 +883,7 @@ class SpecMetadata:
             temp_val = _first_or_none(sampling_config.temperature)
             tk_val = _first_or_none(sampling_config.top_k)
             tp_val = _first_or_none(sampling_config.top_p)
+            repetition = get_repetition_penalty(sampling_config)
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
@@ -870,24 +899,27 @@ class SpecMetadata:
                 top_p=tp_val,
             )
 
-            has_non_greedy_requests |= not is_greedy
-
-            per_request_normalized.append(
-                (temp_val, tk_val, tp_val, num_tokens))
             # py_seq_slot is a stable per-request id used to scatter/gather draft
             # probs across iterations. Dummy/padding requests (py_seq_slot is
             # None) route to the scratch row captured at allocation time (the
             # buffer's real last row), not max_num_requests, which a graph copy
             # shrinks to the bucket size and would alias a real request's slot.
-            per_request_slot_ids.append(
-                request.py_seq_slot if request.
-                py_seq_slot is not None else self.dummy_slot_row)
+            is_dummy_request = request.py_seq_slot is None
+            slot = (request.py_seq_slot
+                    if not is_dummy_request else self.dummy_slot_row)
+            per_request_slot_ids.append(slot)
+            if is_dummy_request:
+                repetition = 1.0
+
+            has_advanced_sampling_requests |= not is_greedy or repetition != 1.0
+            per_request_normalized.append(
+                (temp_val, tk_val, tp_val, num_tokens, repetition))
 
         # Used in the CUDA graph key to pick the argmax / advanced variant.
         # All-greedy iff EVERY request is greedy -- note a non-greedy request
         # may still enable no filter (e.g. temperature=1.0 with top_k/top_p
         # unset), so this cannot be derived from which filters are in use.
-        self.is_all_greedy_sample = not has_non_greedy_requests
+        self.is_all_greedy_sample = not has_advanced_sampling_requests
 
         # Warmup-time override: force the advanced-sampling path so the CUDA
         # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
@@ -896,8 +928,8 @@ class SpecMetadata:
         if getattr(self, '_force_non_greedy_for_capture', False):
             self.is_all_greedy_sample = False
             per_request_normalized = [
-                (0.7, 50, 0.9, num_tokens)
-                for (_, _, _, num_tokens) in per_request_normalized
+                (0.7, 50, 0.9, num_tokens, repetition)
+                for (_, _, _, num_tokens, repetition) in per_request_normalized
             ]
 
         # Apply the group-synchronized override last (semantics: see the
@@ -950,6 +982,8 @@ class SpecMetadata:
         # batch_slot_ids below; this runs earlier than prepare() in the
         # model-engine flow. No-op unless use_rejection_sampling is set.
         self.prepare_rejection_sampling_buffers()
+        if self.supports_repetition_penalty:
+            self.prepare_linear_repetition_penalty_buffers()
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -963,7 +997,7 @@ class SpecMetadata:
         # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
         # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
         actual_flat_size = sum(
-            num_tokens for _, _, _, num_tokens in per_request_normalized)
+            num_tokens for _, _, _, num_tokens, _ in per_request_normalized)
         required_flat_size = max(tokens_per_request * self.max_num_requests,
                                  actual_flat_size)
 
@@ -994,11 +1028,20 @@ class SpecMetadata:
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot.
-        if self.use_rejection_sampling and self.batch_slot_ids is not None:
+        if self.repetition_state is not None:
+            self.repetition_state.stage_batch(
+                requests,
+                [values[-1] for values in per_request_normalized],
+                per_request_slot_ids,
+                self.batch_slot_ids,
+            )
+        elif self.use_rejection_sampling and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
+                torch.tensor(
+                    per_request_slot_ids,
+                    dtype=torch.long,
+                    pin_memory=prefer_pinned(),
+                ),
                 non_blocking=True,
             )
 
@@ -1024,7 +1067,7 @@ class SpecMetadata:
             request_temperatures: list[float] = []
             request_top_ks: list[int] = []
             request_top_ps: list[float] = []
-            for temp_val, tk_val, tp_val, _ in per_request_normalized:
+            for temp_val, tk_val, tp_val, _, _ in per_request_normalized:
                 request_temperatures.append(temp_val)
                 request_top_ks.append(tk_val)
                 request_top_ps.append(tp_val)
@@ -1061,7 +1104,7 @@ class SpecMetadata:
             temperatures: list[float] = []
             top_ks: list[int] = []
             top_ps: list[float] = []
-            for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+            for temp_val, tk_val, tp_val, num_tokens, _ in per_request_normalized:
                 temperatures.extend(temp_val for _ in range(num_tokens))
                 top_ks.extend(tk_val for _ in range(num_tokens))
                 top_ps.extend(tp_val for _ in range(num_tokens))
@@ -1077,7 +1120,7 @@ class SpecMetadata:
                                             non_blocking=True)
 
     def _sampling_params_buffers_need_update(
-        self, per_request_normalized: list[tuple[float, int, float, int]]
+        self, per_request_normalized: list[tuple[float, int, float, int, float]]
     ) -> tuple[bool, bool]:
         """Report which sampling-parameter buffers this step has to refill.
 
@@ -1105,8 +1148,8 @@ class SpecMetadata:
         so it stays valid for as long as they do.
         """
         values = tuple((temp, top_k, top_p)
-                       for temp, top_k, top_p, _ in per_request_normalized)
-        num_tokens = tuple(n for *_, n in per_request_normalized)
+                       for temp, top_k, top_p, _, _ in per_request_normalized)
+        num_tokens = tuple(n for _, _, _, n, _ in per_request_normalized)
 
         request_signature = values
         expanded_signature = (values, num_tokens)
@@ -1536,7 +1579,23 @@ class SpecWorkerBase(nn.Module, ABC):
         runs on the gen subset. Draft probs for the gen subset are gathered
         from the slot-indexed buffer by `py_seq_slot`.
         """
+        sampling_logits = logits
+        repetition_state = getattr(spec_metadata, "repetition_state", None)
+        if (repetition_state is not None
+                and not spec_metadata.is_all_greedy_sample):
+            sampling_logits = apply_linear_spec_repetition_penalty(
+                logits,
+                draft_tokens,
+                num_contexts=num_contexts,
+                batch_size=batch_size,
+                batch_slot_ids=spec_metadata.batch_slot_ids,
+                repetition=repetition_state.repetition_cuda,
+                seen_words=repetition_state.seen_words_cuda,
+                vocab_size=repetition_state.vocab_size,
+            )
+
         num_gens = batch_size - num_contexts
+        result = None
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             draft_len = draft_tokens.shape[1]
             stored_vocab = (spec_metadata.draft_probs_last_dim
@@ -1547,18 +1606,35 @@ class SpecWorkerBase(nn.Module, ABC):
             # acceptance.
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
-                                             batch_size, logits, spec_metadata):
+                                             batch_size, sampling_logits,
+                                             spec_metadata):
                 # Gather the gen subset's slot rows, filled at the previous draft
                 # step indexed by py_seq_slot.
                 gen_slot_ids = spec_metadata.batch_slot_ids[
                     num_contexts:batch_size]
                 draft_probs = spec_metadata.draft_probs[
                     gen_slot_ids, :draft_len, :stored_vocab]
-                return self._sample_and_accept_draft_tokens_rejection(
-                    logits, draft_tokens, draft_probs, num_contexts, batch_size,
-                    spec_metadata)
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+                result = self._sample_and_accept_draft_tokens_rejection(
+                    sampling_logits, draft_tokens, draft_probs, num_contexts,
+                    batch_size, spec_metadata)
+        if result is None:
+            result = self._sample_and_accept_draft_tokens_base(
+                sampling_logits, draft_tokens, num_contexts, batch_size,
+                spec_metadata)
+
+        if (repetition_state is not None
+                and not spec_metadata.is_all_greedy_sample):
+            accepted_tokens, num_accepted_tokens = result
+            commit_linear_spec_seen_tokens(
+                accepted_tokens,
+                num_accepted_tokens,
+                batch_slot_ids=spec_metadata.batch_slot_ids[:batch_size],
+                repetition=repetition_state.repetition_cuda[:batch_size],
+                seen_words=repetition_state.seen_words_cuda,
+                dummy_slot_row=repetition_state.dummy_slot_row,
+                vocab_size=repetition_state.vocab_size,
+            )
+        return result
 
     def _draft_logits_are_sharded(self, logits, spec_metadata):
         """Whether the draft logits are vocab-sharded and need a TP gather.
@@ -2264,7 +2340,8 @@ class SpecWorkerBase(nn.Module, ABC):
         tables and kernel wrappers are manager-specific.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
+        # draft_kv_cache_manager is None for two-engine speculative decoding or
+        # when a separate draft KV cache is disabled.
         if draft_kv_cache_manager is None:
             yield attn_metadata
             return
