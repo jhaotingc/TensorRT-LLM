@@ -27,6 +27,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative import interface as spec_interface
 from tensorrt_llm._torch.speculative.interface import (
     SpecMetadata,
     SpeculativeDecodingMode,
@@ -44,7 +45,7 @@ class _SamplingWorker(SpecWorkerBase):
         raise NotImplementedError
 
 
-def _request(*, seed, generated, state=LlmRequestState.GENERATION_IN_PROGRESS):
+def _request(*, seed, generated, slot=0, state=LlmRequestState.GENERATION_IN_PROGRESS):
     prompt_len = 100
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
@@ -54,7 +55,7 @@ def _request(*, seed, generated, state=LlmRequestState.GENERATION_IN_PROGRESS):
             random_seed=[seed] if seed is not None else None,
         ),
         state=state,
-        py_seq_slot=0,
+        py_seq_slot=slot,
         py_orig_prompt_len=prompt_len,
         max_beam_num_tokens=prompt_len + generated,
     )
@@ -214,6 +215,54 @@ def test_mtp_target_rng_uses_request_seed_and_output_position(monkeypatch):
     )
     torch.testing.assert_close(actual, expected)
     # Target sampling must not advance the separate draft-proposal stream.
+    assert worker.seed is None
+    assert worker.offset is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA metadata buffers")
+def test_mtp_target_rng_batches_by_speculative_depth(monkeypatch):
+    """MTP3 uses four request-batched sampling calls, not one call per row."""
+    monkeypatch.setenv("TRTLLM_MTP_ALIGN_TARGET_RNG", "1")
+    meta = SpecMetadata(
+        max_num_requests=2,
+        max_draft_len=3,
+        max_total_draft_tokens=6,
+        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        runtime_draft_len=3,
+        advanced_sampling_mode=AdvancedSamplingMode.NO_TOPK,
+    )
+    meta.populate_sampling_params_for_one_model(
+        [
+            _request(seed=42, generated=7, slot=0),
+            _request(seed=42, generated=7, slot=1),
+        ]
+    )
+
+    calls = []
+
+    def fake_sample(logits, temperatures, top_k, top_p, *, seed, offset):
+        calls.append(
+            {
+                "row_ids": logits[:, 0].to(dtype=torch.int64).cpu().tolist(),
+                "seeds": seed.cpu().tolist(),
+                "offsets": offset.cpu().tolist(),
+            }
+        )
+        return logits[:, 0].to(dtype=torch.int64)
+
+    monkeypatch.setattr(spec_interface, "sample_from_logits_op", fake_sample)
+    logits = torch.arange(16, dtype=torch.float32, device="cuda").reshape(8, 2)
+    worker = _SamplingWorker()
+    actual = worker._sample_tokens_for_batch(logits, meta, num_contexts=0, batch_size=2)
+
+    assert calls == [
+        {"row_ids": [0, 8], "seeds": [42, 42], "offsets": [224, 224]},
+        {"row_ids": [2, 10], "seeds": [42, 42], "offsets": [256, 256]},
+        {"row_ids": [4, 12], "seeds": [42, 42], "offsets": [288, 288]},
+        {"row_ids": [6, 14], "seeds": [42, 42], "offsets": [320, 320]},
+    ]
+    assert actual.tolist() == [0, 2, 4, 6, 8, 10, 12, 14]
+    # Target sampling remains separate from the draft-proposal RNG stream.
     assert worker.seed is None
     assert worker.offset is None
 
