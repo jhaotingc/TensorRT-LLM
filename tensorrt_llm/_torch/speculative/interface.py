@@ -29,14 +29,14 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention_backend.interface import AttentionMetadata
-from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention, TrtllmAttentionMetadata
+from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
+                                        TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManagerType
+from ..pyexecutor.resource_manager import (BaseResourceManager,
+                                           ResourceManagerType)
 from ..pyexecutor.sampler.sampler_common import (
-    DEFAULT_SAMPLING_SEED,
-    FLASHINFER_SAMPLING_OFFSET_STRIDE,
-    request_random_seed,
-)
+    DEFAULT_SAMPLING_SEED, FLASHINFER_SAMPLING_OFFSET_STRIDE,
+    request_random_seed)
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -48,11 +48,8 @@ if IS_FLASHINFER_AVAILABLE:
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 from ..pyexecutor.sampler.ops.flashinfer import (
-    compute_probs_from_logits,
-    resolve_advanced_sampling_filters,
-    sample_from_logits_op,
-    sampling_batch_spec_dec_one_model_for_rejection,
-)
+    compute_probs_from_logits, resolve_advanced_sampling_filters,
+    sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
@@ -177,11 +174,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
-    from ..attention_backend.sparse.dsa import (
-        DSAtrtllmAttentionMetadata,
-        Indexer,
-        is_dsa_cache_manager,
-    )
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer, is_dsa_cache_manager)
 
     # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
     # different dual-pool layout. Only native DSA cache managers use the DSA
@@ -790,7 +784,8 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
+            GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
         # Sentinel temperature for greedy / temperature-disabled rows. Must stay
@@ -1136,10 +1131,10 @@ class SpecWorkerBase(nn.Module, ABC):
         if self._align_mtp_target_rng:
             logger.warning(
                 f"{ALIGN_MTP_TARGET_RNG_ENV_VAR}=1: MTP target rows will be "
-                "sampled separately to align their Philox stream with "
-                "TorchSampler. This diagnostic mode reduces performance; set "
-                "an explicit request seed for reproducible MTP/no-MTP A/B "
-                "tests.")
+                "sampled in logical-depth batches to align their Philox "
+                "stream with TorchSampler. This diagnostic mode issues one "
+                "sampling call per target depth; set an explicit request seed "
+                "for reproducible MTP/no-MTP A/B tests.")
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
@@ -2279,6 +2274,110 @@ class SpecWorkerBase(nn.Module, ABC):
         finally:
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
+    def _sample_mtp_targets_by_depth(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
+        seeds: torch.Tensor,
+        offsets: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Sample one FlashInfer batch per logical MTP target depth.
+
+        One-model MTP stores generation target rows in request-major order::
+
+            A0 A1 ... AK B0 B1 ... BK
+
+        Regular decoding instead samples one request batch at each output
+        depth. Regrouping the rows as ``[A0, B0]``, then ``[A1, B1]``, and so
+        on keeps each request on the same FlashInfer ``blockIdx.x`` it would
+        occupy in consecutive regular-decoding calls. This matters for the
+        pinned FlashInfer, which reads only ``seed[0]``/``offset[0]`` as the
+        call-wide Philox base and separates batch rows by ``blockIdx.x``.
+
+        For MTP3 pure generation this makes four batched sampling calls,
+        independent of request concurrency, instead of one call per target
+        row. The Python loop is static for each CUDA-graph key because logits
+        shape, batch size, and draft length are fixed at capture time.
+        """
+        num_gens = batch_size - num_contexts
+        if num_gens == 0:
+            return sample_from_logits_op(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                seed=seeds,
+                offset=offsets,
+            )
+
+        num_generation_rows = logits.shape[0] - num_contexts
+        assert num_generation_rows % num_gens == 0
+        target_depths = num_generation_rows // num_gens
+
+        # FlashInfer requires contiguous logits. Transpose the request-major
+        # rows once so every depth slice below is a contiguous request batch.
+        gen_logits = (logits[num_contexts:].reshape(
+            num_gens, target_depths, -1).transpose(0, 1).contiguous())
+        gen_temperatures = (temperatures[num_contexts:].reshape(
+            num_gens, target_depths).transpose(0, 1).contiguous())
+        gen_top_ks = (None if top_ks is None else top_ks[num_contexts:].reshape(
+            num_gens, target_depths).transpose(0, 1).contiguous())
+        gen_top_ps = (None if top_ps is None else top_ps[num_contexts:].reshape(
+            num_gens, target_depths).transpose(0, 1).contiguous())
+        gen_seeds = (seeds[num_contexts:].reshape(num_gens,
+                                                  target_depths).transpose(
+                                                      0, 1).contiguous())
+        gen_offsets = (offsets[num_contexts:].reshape(num_gens,
+                                                      target_depths).transpose(
+                                                          0, 1).contiguous())
+
+        context_tokens = None
+        generation_tokens_by_depth = []
+        for depth in range(target_depths):
+            depth_logits = gen_logits[depth]
+            depth_temperatures = gen_temperatures[depth]
+            depth_top_ks = None if gen_top_ks is None else gen_top_ks[depth]
+            depth_top_ps = None if gen_top_ps is None else gen_top_ps[depth]
+            depth_seeds = gen_seeds[depth]
+            depth_offsets = gen_offsets[depth]
+
+            if depth == 0 and num_contexts > 0:
+                depth_logits = torch.cat((logits[:num_contexts], depth_logits))
+                depth_temperatures = torch.cat(
+                    (temperatures[:num_contexts], depth_temperatures))
+                if depth_top_ks is not None:
+                    depth_top_ks = torch.cat(
+                        (top_ks[:num_contexts], depth_top_ks))
+                if depth_top_ps is not None:
+                    depth_top_ps = torch.cat(
+                        (top_ps[:num_contexts], depth_top_ps))
+                depth_seeds = torch.cat((seeds[:num_contexts], depth_seeds))
+                depth_offsets = torch.cat(
+                    (offsets[:num_contexts], depth_offsets))
+
+            depth_tokens = sample_from_logits_op(
+                depth_logits,
+                depth_temperatures,
+                depth_top_ks,
+                depth_top_ps,
+                seed=depth_seeds,
+                offset=depth_offsets,
+            )
+            if depth == 0 and num_contexts > 0:
+                context_tokens = depth_tokens[:num_contexts]
+                depth_tokens = depth_tokens[num_contexts:]
+            generation_tokens_by_depth.append(depth_tokens)
+
+        generation_tokens = torch.stack(generation_tokens_by_depth,
+                                        dim=1).reshape(-1)
+        if context_tokens is None:
+            return generation_tokens
+        return torch.cat((context_tokens, generation_tokens))
+
     def _sample_tokens_for_batch(
         self,
         logits: torch.Tensor,
@@ -2316,23 +2415,16 @@ class SpecWorkerBase(nn.Module, ABC):
                     and spec_metadata.spec_dec_mode.is_mtp_one_model()):
                 assert spec_metadata.target_seeds is not None
                 assert spec_metadata.target_offsets is not None
-                # FlashInfer 0.6.16 accepts batch-shaped seed/offset tensors
-                # but its kernels still read only element 0 and distinguish
-                # rows with blockIdx.x. Launching one row at a time is the
-                # diagnostic compatibility path that makes row N consume the
-                # same (seed, offset) as regular one-token TorchSampler step N.
-                sampled_tokens = torch.cat([
-                    sample_from_logits_op(
-                        logits[row:row + 1],
-                        temperatures[row:row + 1],
-                        (None if eff_top_ks is None else eff_top_ks[row:row +
-                                                                    1]),
-                        (None if eff_top_ps is None else eff_top_ps[row:row +
-                                                                    1]),
-                        seed=spec_metadata.target_seeds[row:row + 1],
-                        offset=spec_metadata.target_offsets[row:row + 1])
-                    for row in range(num_tokens)
-                ])
+                sampled_tokens = self._sample_mtp_targets_by_depth(
+                    logits,
+                    temperatures,
+                    eff_top_ks,
+                    eff_top_ps,
+                    spec_metadata.target_seeds[:num_tokens],
+                    spec_metadata.target_offsets[:num_tokens],
+                    num_contexts,
+                    batch_size,
+                )
             else:
                 # Legacy one-model behavior. This call-wide counter is kept
                 # separate from the position-keyed target stream above and is
