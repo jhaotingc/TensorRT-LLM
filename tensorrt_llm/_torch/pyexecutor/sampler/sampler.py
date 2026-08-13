@@ -98,7 +98,9 @@ from .logprobs import (
 from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
+    DEFAULT_SAMPLING_SEED,
     DEFAULT_STEP_IDX,
+    FLASHINFER_SAMPLING_OFFSET_STRIDE,
     FinishReasonsList,
     _get_beam_width_out,
     _get_max_beam_width,
@@ -750,7 +752,7 @@ class _SeedManager:
     # by the largest reserve. Offsets are int64, so spending 32 units where 1
     # would do costs nothing observable, and the stream stays non-overlapping
     # for every strategy.
-    OFFSET_STRIDE = 32
+    OFFSET_STRIDE = FLASHINFER_SAMPLING_OFFSET_STRIDE
 
     def __init__(self, *, max_num_sequences: int, global_seed: int):
         self._global_seed = global_seed
@@ -1527,7 +1529,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
         # Initialize seed for multi-GPU consistency
-        self._global_seed = 42
+        self._global_seed = DEFAULT_SAMPLING_SEED
         self._generator: torch.Generator | None = None
 
         # Per-request RNG state backing SamplingParams.seed. Kept per sequence

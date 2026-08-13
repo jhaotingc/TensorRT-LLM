@@ -19,12 +19,45 @@ mode resolution, a CUDA check that NO_TOPK yields the same distribution as FULL
 when top_k is disabled, and native greedy handling (greedy rows return argmax).
 """
 
+import types
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative.interface import (
+    SpecMetadata,
+    SpeculativeDecodingMode,
+    SpecWorkerBase,
+)
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
+
+
+class _SamplingWorker(SpecWorkerBase):
+    @property
+    def max_draft_len(self):
+        return 3
+
+    def _forward_impl(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def _request(*, seed, generated, state=LlmRequestState.GENERATION_IN_PROGRESS):
+    prompt_len = 100
+    return types.SimpleNamespace(
+        sampling_config=types.SimpleNamespace(
+            temperature=[1.0],
+            top_k=None,
+            top_p=[0.95],
+            random_seed=[seed] if seed is not None else None,
+        ),
+        state=state,
+        py_seq_slot=0,
+        py_orig_prompt_len=prompt_len,
+        max_beam_num_tokens=prompt_len + generated,
+    )
 
 
 def test_enum_skip_properties():
@@ -137,6 +170,52 @@ def test_greedy_row_returns_argmax_natively(mode):
     argmax = logits.argmax(dim=-1)
     assert tokens[0].item() == argmax[0].item()
     assert tokens[1].item() == argmax[1].item()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA + flashinfer sampling kernels"
+)
+def test_mtp_target_rng_uses_request_seed_and_output_position(monkeypatch):
+    """The diagnostic path assigns each target row the same stateless Philox
+    position that regular per-request TorchSampler sampling would use."""
+    monkeypatch.setenv("TRTLLM_MTP_ALIGN_TARGET_RNG", "1")
+    meta = SpecMetadata(
+        max_num_requests=1,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        runtime_draft_len=3,
+        advanced_sampling_mode=AdvancedSamplingMode.NO_TOPK,
+    )
+    meta.populate_sampling_params_for_one_model([_request(seed=1234, generated=7)])
+
+    assert meta.target_seeds is not None
+    assert meta.target_offsets is not None
+    assert meta.target_seeds[:4].tolist() == [1234] * 4
+    assert meta.target_offsets[:4].tolist() == [224, 256, 288, 320]
+
+    torch.manual_seed(5)
+    logits = torch.randn(4, 4096, dtype=torch.float32, device="cuda")
+    worker = _SamplingWorker()
+    actual = worker._sample_tokens_for_batch(logits, meta, 0, 1)
+
+    expected = torch.cat(
+        [
+            su.sample_from_logits_op(
+                logits[row : row + 1],
+                meta.temperatures[row : row + 1],
+                None,
+                meta.top_ps[row : row + 1],
+                seed=meta.target_seeds[row : row + 1],
+                offset=meta.target_offsets[row : row + 1],
+            )
+            for row in range(4)
+        ]
+    )
+    torch.testing.assert_close(actual, expected)
+    # Target sampling must not advance the separate draft-proposal stream.
+    assert worker.seed is None
+    assert worker.offset is None
 
 
 def test_advanced_mode_accepted_on_all_spec_paths():

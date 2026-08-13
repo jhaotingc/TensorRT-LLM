@@ -35,6 +35,12 @@ T = TypeVar("T")
 DEFAULT_BEAM_IDX = 0
 # Step index to use when no speculative decoding is used but a step index is required
 DEFAULT_STEP_IDX = 0
+# Global seed used by the PyTorch sampler when a request has no explicit seed.
+DEFAULT_SAMPLING_SEED = 42
+# Philox offset units reserved for one top-k/top-p sampling row. Keeping this
+# shared lets speculative target sampling reproduce the regular sampler's
+# per-request RNG stream.
+FLASHINFER_SAMPLING_OFFSET_STRIDE = 32
 
 FinishReasonsList: TypeAlias = list[list[list[int]]]
 

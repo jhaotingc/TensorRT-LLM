@@ -29,11 +29,14 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention_backend.interface import AttentionMetadata
-from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
-                                        TrtllmAttentionMetadata)
+from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention, TrtllmAttentionMetadata
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManagerType
+from ..pyexecutor.sampler.sampler_common import (
+    DEFAULT_SAMPLING_SEED,
+    FLASHINFER_SAMPLING_OFFSET_STRIDE,
+    request_random_seed,
+)
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -45,8 +48,11 @@ if IS_FLASHINFER_AVAILABLE:
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 from ..pyexecutor.sampler.ops.flashinfer import (
-    compute_probs_from_logits, resolve_advanced_sampling_filters,
-    sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
+    compute_probs_from_logits,
+    resolve_advanced_sampling_filters,
+    sample_from_logits_op,
+    sampling_batch_spec_dec_one_model_for_rejection,
+)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
@@ -91,6 +97,7 @@ def rejection_sampling_one_model(
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+ALIGN_MTP_TARGET_RNG_ENV_VAR = "TRTLLM_MTP_ALIGN_TARGET_RNG"
 
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
@@ -170,8 +177,11 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
-    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer, is_dsa_cache_manager)
+    from ..attention_backend.sparse.dsa import (
+        DSAtrtllmAttentionMetadata,
+        Indexer,
+        is_dsa_cache_manager,
+    )
 
     # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
     # different dual-pool layout. Only native DSA cache managers use the DSA
@@ -599,6 +609,12 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    # Stateless Philox state for each target-logits row. Populated from the
+    # request seed and committed output position so diagnostic MTP sampling can
+    # reproduce the regular TorchSampler stream without draft calls advancing
+    # it. Shape matches temperatures/top_ks/top_ps.
+    target_seeds: Optional[torch.Tensor] = None
+    target_offsets: Optional[torch.Tensor] = None
     # Whether top-k/top-p/temperature are globally disabled for the current batch.
     skip_temperature: bool = False
     skip_top_k: bool = False
@@ -774,8 +790,7 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
-            GREEDY_TEMPERATURE_THRESHOLD
+        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
         # Sentinel temperature for greedy / temperature-disabled rows. Must stay
@@ -992,6 +1007,15 @@ class SpecMetadata:
             self.request_top_ps = torch.ones(self.max_num_requests,
                                              dtype=torch.float32,
                                              device='cuda')
+        if (self.target_seeds is None
+                or self.target_seeds.numel() < required_flat_size):
+            self.target_seeds = torch.full((required_flat_size, ),
+                                           DEFAULT_SAMPLING_SEED,
+                                           dtype=torch.int64,
+                                           device='cuda')
+            self.target_offsets = torch.zeros(required_flat_size,
+                                              dtype=torch.int64,
+                                              device='cuda')
 
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
@@ -1017,13 +1041,30 @@ class SpecMetadata:
         request_temperatures: list[float] = []
         request_top_ks: list[int] = []
         request_top_ps: list[float] = []
-        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+        target_seeds: list[int] = []
+        target_offsets: list[int] = []
+        for request, (temp_val, tk_val, tp_val,
+                      num_tokens) in zip(requests, per_request_normalized):
             request_temperatures.append(temp_val)
             request_top_ks.append(tk_val)
             request_top_ps.append(tp_val)
             temperatures.extend(temp_val for _ in range(num_tokens))
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
+
+            request_seed = request_random_seed(request)
+            target_seed = (DEFAULT_SAMPLING_SEED
+                           if request_seed is None else request_seed)
+            prompt_len = getattr(
+                request, 'py_orig_prompt_len',
+                getattr(request, 'orig_prompt_len',
+                        request.max_beam_num_tokens))
+            num_generated_tokens = max(0,
+                                       request.max_beam_num_tokens - prompt_len)
+            target_seeds.extend(target_seed for _ in range(num_tokens))
+            target_offsets.extend((num_generated_tokens + step) *
+                                  FLASHINFER_SAMPLING_OFFSET_STRIDE
+                                  for step in range(num_tokens))
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -1034,6 +1075,14 @@ class SpecMetadata:
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
+        assert self.target_seeds is not None
+        assert self.target_offsets is not None
+        self.target_seeds[:len(target_seeds)].copy_(torch.tensor(
+            target_seeds, dtype=torch.int64, pin_memory=prefer_pinned()),
+                                                    non_blocking=True)
+        self.target_offsets[:len(target_offsets)].copy_(torch.tensor(
+            target_offsets, dtype=torch.int64, pin_memory=prefer_pinned()),
+                                                        non_blocking=True)
         self.request_temperatures[:len(request_temperatures)].copy_(
             torch.tensor(request_temperatures,
                          dtype=torch.float32,
@@ -1082,6 +1131,15 @@ class SpecWorkerBase(nn.Module, ABC):
                 "the version pinned in requirements.txt.")
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
+        self._align_mtp_target_rng = os.environ.get(
+            ALIGN_MTP_TARGET_RNG_ENV_VAR, "0") == "1"
+        if self._align_mtp_target_rng:
+            logger.warning(
+                f"{ALIGN_MTP_TARGET_RNG_ENV_VAR}=1: MTP target rows will be "
+                "sampled separately to align their Philox stream with "
+                "TorchSampler. This diagnostic mode reduces performance; set "
+                "an explicit request seed for reproducible MTP/no-MTP A/B "
+                "tests.")
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
@@ -2252,25 +2310,48 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
-            # Lazily initialize seed/offset tensors on correct device
-            if self.seed is None:
-                self.seed = torch.tensor([0],
-                                         dtype=torch.int64,
-                                         device=logits.device)
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=logits.device)
-            self.seed += 1
-            self.seed %= (2**31)
-
             eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
                 spec_metadata.advanced_sampling_mode, top_ks, top_ps)
-            sampled_tokens = sample_from_logits_op(logits,
-                                                   temperatures,
-                                                   eff_top_ks,
-                                                   eff_top_ps,
-                                                   seed=self.seed,
-                                                   offset=self.offset)
+            if (self._align_mtp_target_rng
+                    and spec_metadata.spec_dec_mode.is_mtp_one_model()):
+                assert spec_metadata.target_seeds is not None
+                assert spec_metadata.target_offsets is not None
+                # FlashInfer 0.6.16 accepts batch-shaped seed/offset tensors
+                # but its kernels still read only element 0 and distinguish
+                # rows with blockIdx.x. Launching one row at a time is the
+                # diagnostic compatibility path that makes row N consume the
+                # same (seed, offset) as regular one-token TorchSampler step N.
+                sampled_tokens = torch.cat([
+                    sample_from_logits_op(
+                        logits[row:row + 1],
+                        temperatures[row:row + 1],
+                        (None if eff_top_ks is None else eff_top_ks[row:row +
+                                                                    1]),
+                        (None if eff_top_ps is None else eff_top_ps[row:row +
+                                                                    1]),
+                        seed=spec_metadata.target_seeds[row:row + 1],
+                        offset=spec_metadata.target_offsets[row:row + 1])
+                    for row in range(num_tokens)
+                ])
+            else:
+                # Legacy one-model behavior. This call-wide counter is kept
+                # separate from the position-keyed target stream above and is
+                # also used for draft proposal sampling.
+                if self.seed is None:
+                    self.seed = torch.tensor([0],
+                                             dtype=torch.int64,
+                                             device=logits.device)
+                    self.offset = torch.tensor([0],
+                                               dtype=torch.int64,
+                                               device=logits.device)
+                self.seed += 1
+                self.seed %= (2**31)
+                sampled_tokens = sample_from_logits_op(logits,
+                                                       temperatures,
+                                                       eff_top_ks,
+                                                       eff_top_ps,
+                                                       seed=self.seed,
+                                                       offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
