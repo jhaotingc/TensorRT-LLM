@@ -604,9 +604,10 @@ class SpecMetadata:
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
     # Stateless Philox state for each target-logits row. Populated from the
-    # request seed and committed output position so diagnostic MTP sampling can
-    # reproduce the regular TorchSampler stream without draft calls advancing
-    # it. Shape matches temperatures/top_ks/top_ps.
+    # request seed and committed output position so diagnostic one-engine
+    # speculative sampling can reproduce the regular TorchSampler stream
+    # without draft calls advancing it. Shape matches
+    # temperatures/top_ks/top_ps.
     target_seeds: Optional[torch.Tensor] = None
     target_offsets: Optional[torch.Tensor] = None
     # Whether top-k/top-p/temperature are globally disabled for the current batch.
@@ -1130,11 +1131,11 @@ class SpecWorkerBase(nn.Module, ABC):
             ALIGN_MTP_TARGET_RNG_ENV_VAR, "0") == "1"
         if self._align_mtp_target_rng:
             logger.warning(
-                f"{ALIGN_MTP_TARGET_RNG_ENV_VAR}=1: MTP target rows will be "
-                "sampled in logical-depth batches to align their Philox "
-                "stream with TorchSampler. This diagnostic mode issues one "
-                "sampling call per target depth; set an explicit request seed "
-                "for reproducible MTP/no-MTP A/B tests.")
+                f"{ALIGN_MTP_TARGET_RNG_ENV_VAR}=1: MTP and DFlash target rows "
+                "will be sampled in logical-depth batches to align their "
+                "Philox stream with TorchSampler. This diagnostic mode issues "
+                "one sampling call per target depth; set an explicit request "
+                "seed for reproducible speculative/non-speculative A/B tests.")
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
@@ -2274,7 +2275,7 @@ class SpecWorkerBase(nn.Module, ABC):
         finally:
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
-    def _sample_mtp_targets_by_depth(
+    def _sample_targets_by_depth(
         self,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
@@ -2285,9 +2286,10 @@ class SpecWorkerBase(nn.Module, ABC):
         num_contexts: int,
         batch_size: int,
     ) -> torch.Tensor:
-        """Sample one FlashInfer batch per logical MTP target depth.
+        """Sample one FlashInfer batch per logical target depth.
 
-        One-model MTP stores generation target rows in request-major order::
+        One-model MTP and DFlash store generation target rows in request-major
+        order::
 
             A0 A1 ... AK B0 B1 ... BK
 
@@ -2298,10 +2300,10 @@ class SpecWorkerBase(nn.Module, ABC):
         pinned FlashInfer, which reads only ``seed[0]``/``offset[0]`` as the
         call-wide Philox base and separates batch rows by ``blockIdx.x``.
 
-        For MTP3 pure generation this makes four batched sampling calls,
-        independent of request concurrency, instead of one call per target
-        row. The Python loop is static for each CUDA-graph key because logits
-        shape, batch size, and draft length are fixed at capture time.
+        For draft length K pure generation this makes K+1 batched sampling
+        calls, independent of request concurrency, instead of one call per
+        target row. The Python loop is static for each CUDA-graph key because
+        logits shape, batch size, and draft length are fixed at capture time.
         """
         num_gens = batch_size - num_contexts
         if num_gens == 0:
@@ -2412,10 +2414,11 @@ class SpecWorkerBase(nn.Module, ABC):
             eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
                 spec_metadata.advanced_sampling_mode, top_ks, top_ps)
             if (self._align_mtp_target_rng
-                    and spec_metadata.spec_dec_mode.is_mtp_one_model()):
+                    and (spec_metadata.spec_dec_mode.is_mtp_one_model()
+                         or spec_metadata.spec_dec_mode.is_dflash())):
                 assert spec_metadata.target_seeds is not None
                 assert spec_metadata.target_offsets is not None
-                sampled_tokens = self._sample_mtp_targets_by_depth(
+                sampled_tokens = self._sample_targets_by_depth(
                     logits,
                     temperatures,
                     eff_top_ks,

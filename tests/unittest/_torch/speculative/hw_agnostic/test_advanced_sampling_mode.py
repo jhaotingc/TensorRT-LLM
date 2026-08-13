@@ -176,7 +176,12 @@ def test_greedy_row_returns_argmax_natively(mode):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA + flashinfer sampling kernels"
 )
-def test_mtp_target_rng_uses_request_seed_and_output_position(monkeypatch):
+@pytest.mark.parametrize(
+    "spec_dec_mode",
+    [SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL, SpeculativeDecodingMode.DFLASH],
+    ids=["mtp", "dflash"],
+)
+def test_aligned_target_rng_uses_request_seed_and_output_position(monkeypatch, spec_dec_mode):
     """The diagnostic path assigns each target row the same stateless Philox
     position that regular per-request TorchSampler sampling would use."""
     monkeypatch.setenv("TRTLLM_MTP_ALIGN_TARGET_RNG", "1")
@@ -184,7 +189,7 @@ def test_mtp_target_rng_uses_request_seed_and_output_position(monkeypatch):
         max_num_requests=1,
         max_draft_len=3,
         max_total_draft_tokens=3,
-        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        spec_dec_mode=spec_dec_mode,
         runtime_draft_len=3,
         advanced_sampling_mode=AdvancedSamplingMode.NO_TOPK,
     )
@@ -220,14 +225,19 @@ def test_mtp_target_rng_uses_request_seed_and_output_position(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA metadata buffers")
-def test_mtp_target_rng_batches_by_speculative_depth(monkeypatch):
-    """MTP3 uses four request-batched sampling calls, not one call per row."""
+@pytest.mark.parametrize(
+    "spec_dec_mode",
+    [SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL, SpeculativeDecodingMode.DFLASH],
+    ids=["mtp", "dflash"],
+)
+def test_aligned_target_rng_batches_by_speculative_depth(monkeypatch, spec_dec_mode):
+    """MTP3 and DFlash3 use four request-batched calls, not one per row."""
     monkeypatch.setenv("TRTLLM_MTP_ALIGN_TARGET_RNG", "1")
     meta = SpecMetadata(
         max_num_requests=2,
         max_draft_len=3,
         max_total_draft_tokens=6,
-        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        spec_dec_mode=spec_dec_mode,
         runtime_draft_len=3,
         advanced_sampling_mode=AdvancedSamplingMode.NO_TOPK,
     )
