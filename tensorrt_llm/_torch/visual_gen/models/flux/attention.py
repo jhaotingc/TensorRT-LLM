@@ -90,7 +90,7 @@ class FluxJointAttention(Attention):
             config.attention.quant_attention_config if config is not None else None
         )
         self.requires_static_e4m3_attention = bool(
-            self.attn_backend in ("CUTEDSL", "FA4")
+            self.attn_backend in ("CUTEDSL", "FA4", "TRTLLM")
             and quant_attention_config is not None
             and quant_attention_config.qk_dtype == "fp8"
             and quant_attention_config.v_dtype == "fp8"

@@ -130,6 +130,9 @@ class AttentionConfig(StrictBaseModel):
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
         }
+        TRTLLM_STATIC_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
+        }
         FA4_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
         }
@@ -152,12 +155,12 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe not in SAGE_RECIPES:
+            if recipe not in SAGE_RECIPES | TRTLLM_STATIC_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes "
+                    f"for backend='TRTLLM'. Supported recipes "
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(SAGE_RECIPES)}."
+                    f"{sorted(SAGE_RECIPES | TRTLLM_STATIC_RECIPES)}."
                 )
         elif self.backend == "FA4":
             if recipe not in FA4_RECIPES:
@@ -220,6 +223,26 @@ class AttentionConfig(StrictBaseModel):
                 "sparse_attention_config are mutually exclusive (the "
                 "CuTeDSLAttention dispatcher selects either the dense path "
                 "or the sparse VSA path, not both)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trtllm_static_fp8_sparse_mutex(self) -> "AttentionConfig":
+        q_config = self.quant_attention_config
+        if (
+            self.backend == "TRTLLM"
+            and q_config is not None
+            and q_config.qk_dtype == "fp8"
+            and q_config.v_dtype == "fp8"
+            and q_config.q_block_size == 0
+            and q_config.k_block_size == 0
+            and q_config.v_block_size == 0
+            and self.sparse_attention_config is not None
+        ):
+            raise ValueError(
+                "TRTLLM-gen static FP8 attention does not support "
+                "sparse_attention_config. Remove sparse attention or use a "
+                "supported blockwise TRTLLM recipe."
             )
         return self
 

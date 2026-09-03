@@ -22,6 +22,7 @@ Handles the specifics of no-KV-cache operation and fused QKV requirements.
 from typing import Optional, Union
 
 import torch
+from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -32,6 +33,8 @@ from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
+
+_TRTLLM_GEN_WORKSPACE_SIZE = 128 * 1024 * 1024
 
 
 class TrtllmAttentionMetadata:
@@ -184,7 +187,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Fused QKV requirement for TRTLLM kernel (used when no quant_attention_config is provided)
     - Metadata creation and preparation
     - No KV cache operation
-    - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
+    - SageAttention per-block QKV quantization for positive block-size recipes
+    - TRTLLM-gen per-tensor FP8 attention for the zero-block static recipe
     """
 
     def __init__(
@@ -221,6 +225,143 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+        self._static_e4m3_state = attention_metadata_state.setdefault("trtllm_gen_static_e4m3", {})
+
+    def _uses_static_e4m3_attention(self) -> bool:
+        config = self.quant_attention_config
+        return bool(
+            config is not None
+            and config.qk_dtype == "fp8"
+            and config.v_dtype == "fp8"
+            and config.q_block_size == 0
+            and config.k_block_size == 0
+            and config.v_block_size == 0
+        )
+
+    @staticmethod
+    def _quantize_static_e4m3(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            tensor.contiguous(), scale
+        )
+        return quantized
+
+    def _get_static_e4m3_buffers(
+        self,
+        device: torch.device,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        workspace_cache = self._static_e4m3_state.setdefault("workspace", {})
+        workspace = workspace_cache.get(device)
+        if workspace is None:
+            workspace = torch.empty(
+                _TRTLLM_GEN_WORKSPACE_SIZE,
+                dtype=torch.uint8,
+                device=device,
+            )
+            workspace_cache[device] = workspace
+
+        metadata_cache = self._static_e4m3_state.setdefault("metadata", {})
+        cache_key = (device, batch_size, seq_len, kv_seq_len)
+        metadata = metadata_cache.get(cache_key)
+        if metadata is None:
+            seq_lens = torch.full(
+                (batch_size,),
+                kv_seq_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            cum_seq_lens_q = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                seq_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            cum_seq_lens_kv = torch.arange(
+                0,
+                (batch_size + 1) * kv_seq_len,
+                kv_seq_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata = (seq_lens, cum_seq_lens_q, cum_seq_lens_kv)
+            metadata_cache[cache_key] = metadata
+
+        return workspace, *metadata
+
+    @torch.compiler.disable
+    def _forward_static_e4m3(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+        attention_mask: PredefinedAttentionMask,
+        **kwargs,
+    ) -> torch.Tensor:
+        if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device)[0] != 10:
+            raise RuntimeError("TRTLLM-gen static FP8 attention requires an SM100-family GPU.")
+        if self.head_dim not in (128, 256):
+            raise ValueError(
+                "TRTLLM-gen static FP8 attention requires head_dim 128 or 256; "
+                f"got {self.head_dim}."
+            )
+
+        static_scales = tuple(
+            kwargs.get(f"static_{operand_name}_scale") for operand_name in ("q", "k", "v")
+        )
+        scale_values = tuple(
+            kwargs.get(f"scale_{operand_name}") for operand_name in ("q", "k", "v")
+        )
+        if any(scale is None for scale in static_scales) or any(
+            scale is None for scale in scale_values
+        ):
+            raise ValueError("Static FP8 TRTLLM-gen requires Q/K/V tensor and host scales.")
+
+        if q.dtype != torch.float8_e4m3fn:
+            q = self._quantize_static_e4m3(q, static_scales[0])
+            k = self._quantize_static_e4m3(k, static_scales[1])
+            v = self._quantize_static_e4m3(v, static_scales[2])
+        elif k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            raise ValueError("Static E4M3 Q/K/V must all use torch.float8_e4m3fn.")
+
+        q = q.reshape(batch_size * seq_len, self.num_heads, self.head_dim).contiguous()
+        k = k.reshape(batch_size * kv_seq_len, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.reshape(batch_size * kv_seq_len, self.num_kv_heads, self.head_dim).contiguous()
+        workspace, seq_lens, cum_seq_lens_q, cum_seq_lens_kv = self._get_static_e4m3_buffers(
+            q.device,
+            batch_size,
+            seq_len,
+            kv_seq_len,
+        )
+
+        output = trtllm_ragged_attention_deepseek(
+            query=q,
+            key=k,
+            value=v,
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=seq_len,
+            max_kv_len=kv_seq_len,
+            bmm1_scale=scale_values[0] * scale_values[1] * self.head_dim**-0.5,
+            bmm2_scale=scale_values[2],
+            o_sf_scale=1.0,
+            batch_size=batch_size,
+            window_left=-1,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            enable_pdl=None,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            return_lse=False,
+            sage_attn_sfs=(None, None, None, None),
+            num_elts_per_sage_attn_blk=(0, 0, 0, 0),
+            backend="trtllm-gen",
+        )
+        return output.view(batch_size, seq_len, -1)
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
@@ -281,8 +422,24 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             Output tensor [B, S, H*D]
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
-        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
+
+        if self._uses_static_e4m3_attention():
+            assert k is not None and v is not None, (
+                "TRTLLM-gen static FP8 attention requires separate Q, K, V tensors"
+            )
+            return self._forward_static_e4m3(
+                q,
+                k,
+                v,
+                batch_size,
+                seq_len,
+                kv_seq_len,
+                attention_mask,
+                **kwargs,
+            )
+
+        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
 
         if self.quant_attention_config is not None:
             assert k is not None and v is not None, (
@@ -326,5 +483,5 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self._preferred_layout
 
     def support_fused_qkv(self) -> bool:
-        """Standard path fuses QKV; SageAttention path does not."""
+        """Only the unquantized path accepts fused QKV."""
         return self.quant_attention_config is None

@@ -18,7 +18,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
@@ -439,7 +442,7 @@ def test_flux1_shared_nvfp4_quantization_is_automatic_for_static_projections():
     assert block._share_nvfp4_quantize
 
 
-@pytest.mark.parametrize("backend", ["CUTEDSL", "FA4"])
+@pytest.mark.parametrize("backend", ["CUTEDSL", "FA4", "TRTLLM"])
 def test_flux1_static_e4m3_attention_scales_use_modelopt_amax(backend):
     from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 
@@ -459,6 +462,8 @@ def test_flux1_static_e4m3_attention_scales_use_modelopt_amax(backend):
         ),
         skip_create_weights_in_init=False,
     )
+    if backend == "TRTLLM":
+        model_config.attention_metadata_state = create_attention_metadata_state()
     attn = FluxJointAttention(
         hidden_size=16,
         num_attention_heads=2,

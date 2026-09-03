@@ -119,6 +119,40 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    def test_supported_quant_config_trtllm_static_fp8(self):
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=0,
+                k_block_size=0,
+                v_block_size=0,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    def test_trtllm_static_fp8_rejects_sparse_attention(self):
+        with pytest.raises(
+            ValidationError,
+            match="TRTLLM-gen static FP8 attention does not support sparse_attention_config",
+        ):
+            AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    v_dtype="fp8",
+                    q_block_size=0,
+                    k_block_size=0,
+                    v_block_size=0,
+                ),
+                sparse_attention_config={
+                    "algorithm": "skip_softmax",
+                    "threshold_scale_factor": 0.1,
+                },
+            )
+
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
             backend="CUTEDSL",
