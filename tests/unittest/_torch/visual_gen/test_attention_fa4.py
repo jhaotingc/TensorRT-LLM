@@ -22,6 +22,10 @@ Requires CUDA (FA4 is GPU-only).
 
 import pytest
 import torch
+import torch.nn.functional as F
+
+from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -190,6 +194,70 @@ def test_split_kv_matches_no_split(num_splits):
         atol=1e-2,
         msg=f"FA4 num_splits={num_splits} diverges from the non-split result",
     )
+
+
+def test_static_fp8_qkv_forward():
+    """Static E4M3 Q/K/V uses calibrated tensor descales."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("FA4 FP8 requires an SM100-family GPU")
+
+    device = torch.device("cuda")
+    batch_size, seq_len, num_heads, head_dim = 1, 256, 4, 128
+    scale_values = {"q": 0.01, "k": 0.0125, "v": 0.02}
+    scale_tensors = {
+        name: torch.tensor(value, dtype=torch.float32, device=device)
+        for name, value in scale_values.items()
+    }
+    backend = FlashAttn4Attention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="fp8",
+            v_dtype="fp8",
+            q_block_size=0,
+            k_block_size=0,
+            v_block_size=0,
+        ),
+    )
+
+    torch.manual_seed(321)
+    q = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(q, scale_tensors["q"])
+    k_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(k, scale_tensors["k"])
+    v_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(v, scale_tensors["v"])
+    out_ref = F.scaled_dot_product_attention(
+        q_fp8.float().mul(scale_values["q"]).to(torch.bfloat16).transpose(1, 2),
+        k_fp8.float().mul(scale_values["k"]).to(torch.bfloat16).transpose(1, 2),
+        v_fp8.float().mul(scale_values["v"]).to(torch.bfloat16).transpose(1, 2),
+        is_causal=False,
+    ).transpose(1, 2)
+
+    kwargs = {
+        "attention_mask": PredefinedAttentionMask.FULL,
+        "static_q_scale": scale_tensors["q"],
+        "static_k_scale": scale_tensors["k"],
+        "static_v_scale": scale_tensors["v"],
+    }
+    out = backend(q, k, v, **kwargs)
+    out_prequantized = backend(q_fp8, k_fp8, v_fp8, **kwargs)
+
+    assert torch.isfinite(out).all()
+    assert out.dtype == torch.bfloat16
+    cosine_similarity = F.cosine_similarity(
+        out.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
+    ).item()
+    assert cosine_similarity > 0.99
+    torch.testing.assert_close(out_prequantized, out, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

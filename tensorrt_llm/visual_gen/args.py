@@ -44,7 +44,7 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / FA4 / CUTEDSL backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
@@ -106,7 +106,7 @@ class AttentionConfig(StrictBaseModel):
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / FA4 / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -129,6 +129,9 @@ class AttentionConfig(StrictBaseModel):
             ("int8", "fp8", (1, 16, 1)),
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
+        }
+        FA4_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
@@ -156,6 +159,14 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(SAGE_RECIPES)}."
                 )
+        elif self.backend == "FA4":
+            if recipe not in FA4_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='FA4'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(FA4_RECIPES)}."
+                )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
@@ -166,7 +177,7 @@ class AttentionConfig(StrictBaseModel):
                 )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'FA4', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )

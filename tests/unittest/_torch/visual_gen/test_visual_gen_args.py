@@ -127,6 +127,28 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    def test_supported_quant_config_fa4_static_fp8(self):
+        attention = AttentionConfig(
+            backend="FA4",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=0,
+                k_block_size=0,
+                v_block_size=0,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FA4",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+                ),
+            )
+
     @pytest.mark.parametrize("v_block_size", [0, 1])
     def test_supported_quant_config_cute_mxfp8(self, v_block_size):
         attention = AttentionConfig(

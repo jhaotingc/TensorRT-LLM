@@ -439,7 +439,8 @@ def test_flux1_shared_nvfp4_quantization_is_automatic_for_static_projections():
     assert block._share_nvfp4_quantize
 
 
-def test_flux1_static_e4m3_attention_scales_use_modelopt_amax():
+@pytest.mark.parametrize("backend", ["CUTEDSL", "FA4"])
+def test_flux1_static_e4m3_attention_scales_use_modelopt_amax(backend):
     from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 
     model_config = DiffusionModelConfig(
@@ -447,7 +448,7 @@ def test_flux1_static_e4m3_attention_scales_use_modelopt_amax():
         quant_config=QuantConfig(),
         mapping=Mapping(),
         attention=AttentionConfig(
-            backend="CUTEDSL",
+            backend=backend,
             quant_attention_config=QuantAttentionConfig(
                 qk_dtype="fp8",
                 v_dtype="fp8",

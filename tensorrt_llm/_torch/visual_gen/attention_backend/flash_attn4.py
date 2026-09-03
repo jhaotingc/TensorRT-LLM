@@ -16,13 +16,16 @@
 Flash Attention 4 Backend for Visual Generation Models
 
 Uses Flash Attention 4 with the CUTE JIT kernel.
-Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
+Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 and
+statically scaled E4M3 inputs on Blackwell GPUs.
 """
 
 import math
 from typing import Optional, Tuple
 
 import torch
+
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
@@ -41,7 +44,7 @@ class FlashAttn4Attention(AttentionBackend):
 
     Uses flash_attn.cute.interface._flash_attn_fwd which:
     - Expects [B, S, H, D] (NHD) format
-    - Supports float16 and bfloat16 (auto-casts other dtypes)
+    - Supports float16, bfloat16, and statically scaled E4M3 inputs
     - Supports both self-attention and cross-attention (different Q/KV lengths)
     """
 
@@ -52,6 +55,7 @@ class FlashAttn4Attention(AttentionBackend):
         head_dim: int = 64,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        quant_attention_config: Optional[QuantAttentionConfig] = None,
         **kwargs,
     ):
         self.layer_idx = layer_idx
@@ -60,9 +64,39 @@ class FlashAttn4Attention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.quant_attention_config = quant_attention_config
+        self._descale_cache: dict[tuple[str, torch.device, int, int], torch.Tensor] = {}
 
         # FA4 expects [B, S, H, D] format
         self._preferred_layout = AttentionTensorLayout.NHD
+
+    def _uses_static_e4m3_attention(self) -> bool:
+        config = self.quant_attention_config
+        return bool(
+            config is not None
+            and config.qk_dtype == "fp8"
+            and config.v_dtype == "fp8"
+            and config.q_block_size == 0
+            and config.k_block_size == 0
+            and config.v_block_size == 0
+        )
+
+    def _expand_descale(
+        self,
+        scale: torch.Tensor,
+        operand_name: str,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if not isinstance(scale, torch.Tensor) or scale.numel() != 1:
+            raise ValueError(f"Static {operand_name} scale must be a scalar tensor.")
+        if scale.dtype != torch.float32:
+            raise ValueError(f"Static {operand_name} scale must use torch.float32.")
+        cache_key = (operand_name, scale.device, scale.data_ptr(), batch_size)
+        descale = self._descale_cache.get(cache_key)
+        if descale is None:
+            descale = scale.reshape(1, 1).expand(batch_size, self.num_kv_heads).contiguous()
+            self._descale_cache[cache_key] = descale
+        return descale
 
     @torch.compiler.disable
     def _fwd(
@@ -72,6 +106,9 @@ class FlashAttn4Attention(AttentionBackend):
         v: torch.Tensor,
         causal: bool,
         seqused_k: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
         # FA4's private forward API may append diagnostics that this backend does not consume.
@@ -91,6 +128,9 @@ class FlashAttn4Attention(AttentionBackend):
             block_sparse_tensors=None,
             return_lse=True,
             num_splits=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return output, lse
 
@@ -109,13 +149,29 @@ class FlashAttn4Attention(AttentionBackend):
 
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 
-        # FA4 only supports float16 and bfloat16
         origin_dtype = q.dtype
-        if q.dtype not in (torch.float16, torch.bfloat16):
+        if q.dtype == torch.float8_e4m3fn:
+            if (
+                not self._uses_static_e4m3_attention()
+                or k.dtype != torch.float8_e4m3fn
+                or v.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    "Prequantized E4M3 Q/K/V require the dense static FP8 attention recipe."
+                )
+            origin_dtype = torch.bfloat16
+        elif q.dtype not in (torch.float16, torch.bfloat16):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
         return q, k, v, is_causal, origin_dtype
+
+    @staticmethod
+    def _quantize_static_e4m3(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            tensor.contiguous(), scale
+        )
+        return quantized
 
     def forward(
         self,
@@ -172,6 +228,22 @@ class FlashAttn4Attention(AttentionBackend):
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
+        descales = (None, None, None)
+        if self._uses_static_e4m3_attention():
+            static_scales = tuple(
+                kwargs.get(f"static_{operand_name}_scale") for operand_name in ("q", "k", "v")
+            )
+            if any(scale is None for scale in static_scales):
+                raise ValueError("Static FP8 FA4 requires scalar Q/K/V scale tensors.")
+            if q.dtype != torch.float8_e4m3fn:
+                q = self._quantize_static_e4m3(q, static_scales[0])
+                k = self._quantize_static_e4m3(k, static_scales[1])
+                v = self._quantize_static_e4m3(v, static_scales[2])
+            descales = tuple(
+                self._expand_descale(scale, operand_name.upper(), q.shape[0])
+                for operand_name, scale in zip(("q", "k", "v"), static_scales, strict=True)
+            )
+
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         seqused_k = None
         if key_padding_mask is not None:
@@ -186,7 +258,16 @@ class FlashAttn4Attention(AttentionBackend):
             # FA4 seqused_k assumes a True-prefix layout: positions [0, valid)
             # are kept, [valid, S_kv) are masked. mask.sum gives the prefix length.
             seqused_k = key_padding_mask.sum(dim=1).to(torch.int32)
-        output, lse = self._fwd(q, k, v, is_causal, seqused_k=seqused_k)
+        output, lse = self._fwd(
+            q,
+            k,
+            v,
+            is_causal,
+            seqused_k=seqused_k,
+            q_descale=descales[0],
+            k_descale=descales[1],
+            v_descale=descales[2],
+        )
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse

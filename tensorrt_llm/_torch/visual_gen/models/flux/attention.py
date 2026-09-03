@@ -90,7 +90,7 @@ class FluxJointAttention(Attention):
             config.attention.quant_attention_config if config is not None else None
         )
         self.requires_static_e4m3_attention = bool(
-            self.attn_backend == "CUTEDSL"
+            self.attn_backend in ("CUTEDSL", "FA4")
             and quant_attention_config is not None
             and quant_attention_config.qk_dtype == "fp8"
             and quant_attention_config.v_dtype == "fp8"
@@ -311,7 +311,7 @@ class FluxJointAttention(Attention):
         if self.requires_static_e4m3_attention:
             if not self.static_e4m3_attention_scales_loaded:
                 raise RuntimeError(
-                    "Static CUTEDSL FP8 attention scales were not loaded. Quantize the "
+                    "Static FP8 attention scales were not loaded. Quantize the "
                     "checkpoint with ModelOpt --quantize-mha and preserve the Q/K/V amax tensors."
                 )
 
@@ -403,7 +403,7 @@ class FluxJointAttention(Attention):
         if self.requires_static_e4m3_attention:
             if not self.static_e4m3_attention_scales_loaded:
                 raise RuntimeError(
-                    "Static CUTEDSL FP8 attention scales were not loaded. Quantize the "
+                    "Static FP8 attention scales were not loaded. Quantize the "
                     "checkpoint with ModelOpt --quantize-mha and preserve the Q/K/V amax tensors."
                 )
             attention_kwargs.update(
