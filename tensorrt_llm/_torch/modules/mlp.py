@@ -282,7 +282,7 @@ class MLP(nn.Module):
         is applied in forward (quant_method can be downgraded after this).
         """
         bf16_ok = is_nvfp4_gemm_gelu_fusion_eligible(self.up_proj,
-                                                    self.activation)
+                                                     self.activation)
         fp4_ok = (bf16_ok and hasattr(
             torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
                   and is_static_nvfp4_input_eligible(self.down_proj))

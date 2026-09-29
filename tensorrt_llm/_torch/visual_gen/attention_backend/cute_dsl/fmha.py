@@ -554,47 +554,31 @@ _FP8_E4M3_MAX = 448.0  # FP8 e4m3 max magnitude
 _FP4_E2M1_MAX = 6.0  # FP4 e2m1 max magnitude
 
 
-def _quantize_fp8_static(
+def _quantize_fp8(
     x_bshd: torch.Tensor,
-    dequant_scale: torch.Tensor | None,
-    operand_name: str,
-) -> torch.Tensor:
-    """Quantize one BSHD operand with a calibrated per-tensor E4M3 scale."""
-    if dequant_scale is None:
-        raise ValueError(
-            f"Static CUTEDSL FP8 attention requires a calibrated {operand_name} scale. "
-            "Quantize the checkpoint with ModelOpt --quantize-mha."
-        )
-    if dequant_scale.numel() != 1:
-        raise ValueError(
-            f"Static CUTEDSL FP8 {operand_name} scale must contain one value; "
-            f"got shape {tuple(dequant_scale.shape)}."
-        )
-    if dequant_scale.dtype != torch.float32:
-        raise ValueError(
-            f"Static CUTEDSL FP8 {operand_name} scale must use torch.float32; "
-            f"got {dequant_scale.dtype}."
-        )
-    if dequant_scale.device != x_bshd.device:
-        raise ValueError(
-            f"Static CUTEDSL FP8 {operand_name} scale must be on {x_bshd.device}; "
-            f"got {dequant_scale.device}."
-        )
-    quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x_bshd, dequant_scale)
-    return quantized
-
-
-def _quantize_fp8_v(
-    v_bshd: torch.Tensor, per_head_channel: bool
+    dequant_scale: torch.Tensor | None = None,
+    per_head_channel: bool = False,
 ) -> Tuple[torch.Tensor, float | torch.Tensor, torch.Tensor | None]:
-    """Quantize V to FP8 with either one tensor scale or an (H, D) scale tensor."""
+    """Quantize to E4M3 with a static, dynamic, or per-head/channel scale."""
     if per_head_channel:
-        v_qscale = _FP8_E4M3_MAX / v_bshd.float().abs().amax(dim=(0, 1)).clamp(min=1e-3)
-        v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
-        return v_quantized, 1.0, v_qscale.reciprocal().contiguous()
+        if dequant_scale is not None:
+            raise ValueError("Per-head/channel FP8 quantization cannot use a per-tensor scale.")
+        qscale = _FP8_E4M3_MAX / x_bshd.float().abs().amax(dim=(0, 1)).clamp(min=1e-3)
+        quantized = (x_bshd * qscale).to(torch.float8_e4m3fn)
+        return quantized, 1.0, qscale.reciprocal().contiguous()
 
-    v_quantized, v_dequant_scale = torch.ops.trtllm.quantize_e4m3_per_tensor(v_bshd.contiguous())
-    return v_quantized, v_dequant_scale.float(), None
+    if dequant_scale is not None:
+        if dequant_scale.numel() != 1 or dequant_scale.dtype != torch.float32:
+            raise ValueError("Static FP8 scale must be one float32 value.")
+        if dequant_scale.device != x_bshd.device:
+            raise ValueError("Static FP8 scale must be on the input device.")
+        quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            x_bshd.contiguous(), dequant_scale
+        )
+        return quantized, dequant_scale, None
+
+    quantized, dequant_scale = torch.ops.trtllm.quantize_e4m3_per_tensor(x_bshd.contiguous())
+    return quantized, dequant_scale.float(), None
 
 
 def _quantize_blockscaled_one(
@@ -751,17 +735,12 @@ class CuTeDSLAttention(AttentionBackend):
 
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 
-        # Smooth-Smooth belongs to the dynamic block-scaled recipes. The dense
-        # FP8 recipe consumes ModelOpt scales calibrated on ordinary post-norm,
-        # post-RoPE Q/K and must not change that distribution at runtime.
+        # Static FP8 scales assume Q/K have not been smoothed.
         qac = self.quant_attention_config
         smooth_qk = qac is not None and qac.qk_dtype in ("mxfp8", "nvfp4")
 
-        # The static E4M3 FLUX path may fuse QK norm, RoPE, and quantization
-        # before entering the backend. Preserve those already-quantized inputs;
-        # dense CUTEDSL FMHA accepts E4M3 Q/K/V directly and returns BF16.
-        prequantized_static_fp8 = q.dtype == torch.float8_e4m3fn
-        if prequantized_static_fp8:
+        # Preserve E4M3 inputs quantized by preceding layers.
+        if q.dtype == torch.float8_e4m3fn:
             if (
                 qac is None
                 or qac.qk_dtype != "fp8"
@@ -776,8 +755,7 @@ class CuTeDSLAttention(AttentionBackend):
         else:
             origin_dtype = q.dtype
 
-        # Published non-quantized kernel inputs support float16 and bfloat16.
-        if not prequantized_static_fp8 and q.dtype not in (torch.float16, torch.bfloat16):
+        if q.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
@@ -822,30 +800,32 @@ class CuTeDSLAttention(AttentionBackend):
         qk_sf_vec = 0
         scale_v_channels = None
         if qac is not None:
+            static_v_scale = None
             if qac.qk_dtype == "fp8":
                 static_q_scale = kwargs.get("static_q_scale")
                 static_k_scale = kwargs.get("static_k_scale")
                 static_v_scale = kwargs.get("static_v_scale")
-                if q.dtype == torch.float8_e4m3fn:
-                    if k.dtype != q.dtype or v.dtype != q.dtype:
-                        raise ValueError("Static E4M3 Q/K/V must all use torch.float8_e4m3fn.")
-                else:
-                    # Generic callers may still provide strided BF16 Q/K/V. The static
-                    # quantization op requires contiguous inputs and emits dense E4M3 tensors.
-                    q = _quantize_fp8_static(q.contiguous(), static_q_scale, "Q")
-                    k = _quantize_fp8_static(k.contiguous(), static_k_scale, "K")
-                    v = _quantize_fp8_static(v.contiguous(), static_v_scale, "V")
+                if any(scale is None for scale in (static_q_scale, static_k_scale, static_v_scale)):
+                    raise ValueError(
+                        "Static CUTEDSL FP8 attention requires calibrated Q/K/V scales."
+                    )
+                if q.dtype != torch.float8_e4m3fn:
+                    q, _, _ = _quantize_fp8(q, static_q_scale)
+                    k, _, _ = _quantize_fp8(k, static_k_scale)
                 sm_scale = sm_scale * static_q_scale * static_k_scale
-                v_dequant_scale = static_v_scale
             elif qac.qk_dtype in ("mxfp8", "nvfp4"):
                 qk_sf_vec = 32 if qac.qk_dtype == "mxfp8" else 16
                 q, q_sf, gs_q = _quantize_blockscaled_one(q, qk_sf_vec)
                 k, k_sf, gs_k = _quantize_blockscaled_one(k, qk_sf_vec)
                 sm_scale = sm_scale * gs_q * gs_k
                 qk_cutlass_dtype = cutlass.Float4E2M1FN if qk_sf_vec == 16 else cutlass.Float8E4M3FN
-            if qac.qk_dtype != "fp8":
-                v, v_dequant_scale, scale_v_channels = _quantize_fp8_v(
-                    v, per_head_channel=qk_sf_vec != 0 and qac.v_block_size == 1
+            if qac.qk_dtype == "fp8" and v.dtype == torch.float8_e4m3fn:
+                v_dequant_scale = static_v_scale
+            else:
+                v, v_dequant_scale, scale_v_channels = _quantize_fp8(
+                    v,
+                    dequant_scale=static_v_scale,
+                    per_head_channel=qk_sf_vec != 0 and qac.v_block_size == 1,
                 )
 
         # Skip softmax.

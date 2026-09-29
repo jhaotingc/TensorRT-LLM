@@ -174,7 +174,10 @@ def _build_single_device_feature_args(
             tp_size=1,
         ),
         cuda_graph_config=CudaGraphConfig(enable=features.cuda_graph),
-        torch_compile_config=TorchCompileConfig(enable=False),
+        torch_compile_config=TorchCompileConfig(
+            enable=False,
+            enable_autotune=features.quantization_source != "static",
+        ),
     )
     if pipeline_config is not None:
         kwargs["pipeline_config"] = pipeline_config
@@ -205,7 +208,7 @@ def _assert_resolved_single_device_feature_config(
     if features.quantization == "NVFP4":
         assert config.force_dynamic_quantization is expected_dynamic_quantization
 
-    assert config.torch_compile.enable_autotune
+    assert config.torch_compile.enable_autotune is (features.quantization_source != "static")
 
     assert config.cache_backend is None
     assert pipeline.cache_accelerator is None

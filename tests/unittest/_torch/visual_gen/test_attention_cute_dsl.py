@@ -23,7 +23,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     _COMPILE_CACHE,
     CuTeDSLAttention,
     _quantize_blockscaled_one,
-    _quantize_fp8_v,
+    _quantize_fp8,
     clear_cute_dsl_fmha_cache,
     cute_dsl_fmha_fwd,
 )
@@ -290,7 +290,7 @@ def test_cute_dsl_fmha_blockscaled_forward(
     # Exercise both V modes: one tensor scale (0) and an (H, D) scale tensor (1).
     q_q, q_sf, scale_q = _quantize_blockscaled_one(q_bf16, qk_sf_vec)
     k_q, k_sf, scale_k = _quantize_blockscaled_one(k_bf16, qk_sf_vec)
-    v_q, scale_v, scale_v_channels = _quantize_fp8_v(v_bf16, per_head_channel=v_block_size == 1)
+    v_q, scale_v, scale_v_channels = _quantize_fp8(v_bf16, per_head_channel=v_block_size == 1)
     qk_cutlass_dtype = getattr(cutlass, qk_cutlass_dtype_name)
 
     out = torch.empty(
@@ -398,7 +398,7 @@ def test_cute_dsl_fmha_blockscaled_forward_skip_softmax(
 
     q_q, q_sf, scale_q = _quantize_blockscaled_one(q_bf16, qk_sf_vec)
     k_q, k_sf, scale_k = _quantize_blockscaled_one(k_bf16, qk_sf_vec)
-    v_q, scale_v, scale_v_channels = _quantize_fp8_v(v_bf16, per_head_channel=False)
+    v_q, scale_v, scale_v_channels = _quantize_fp8(v_bf16, per_head_channel=False)
     qk_cutlass_dtype = getattr(cutlass, qk_cutlass_dtype_name)
 
     def _run(threshold: float) -> torch.Tensor:
