@@ -71,7 +71,7 @@ class FluxJointAttention(Attention):
         )
         requests_static_e4m3_attention = bool(
             config is not None
-            and config.attention.backend == "CUTEDSL"
+            and config.attention.backend in ("CUTEDSL", "CUDNN")
             and quant_attention_config is not None
             and quant_attention_config.qk_dtype == "fp8"
             and quant_attention_config.v_dtype == "fp8"
@@ -81,7 +81,7 @@ class FluxJointAttention(Attention):
         )
         if requests_static_e4m3_attention and not supports_static_e4m3_attention:
             raise ValueError(
-                "Static CUTEDSL E4M3 attention is not yet implemented for FLUX.2 because "
+                "Static E4M3 attention is not yet implemented for FLUX.2 because "
                 "its attention paths do not load or forward the required Q/K/V scales."
             )
 
@@ -107,7 +107,7 @@ class FluxJointAttention(Attention):
         )
 
         self.requires_static_e4m3_attention = bool(
-            requests_static_e4m3_attention and self.attn_backend == "CUTEDSL"
+            requests_static_e4m3_attention and self.attn_backend in ("CUTEDSL", "CUDNN")
         )
         self.register_buffer(
             "_static_q_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
@@ -368,7 +368,7 @@ class FluxJointAttention(Attention):
         )
         if self.requires_static_e4m3_attention and not self.static_e4m3_attention_scales_loaded:
             raise RuntimeError(
-                "Static CUTEDSL FP8 attention scales were not loaded. Quantize the "
+                "Static FP8 attention scales were not loaded. Quantize the "
                 "checkpoint with ModelOpt --quantize-mha and preserve the Q/K/V amax tensors."
             )
         output_dtype = hidden_states.dtype

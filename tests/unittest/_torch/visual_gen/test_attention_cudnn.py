@@ -248,3 +248,31 @@ def test_cudnn_fp8_attention_with_fused_qkv(num_kv_heads):
     ):
         cosine = F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
         assert cosine > MIN_COSINE["fp8"], f"{what}: cosine similarity {cosine} too low"
+
+
+def test_cudnn_fp8_attention_uses_static_scales():
+    """Calibrated descales work with both pre-quantized and BF16 Q/K/V."""
+    _require_cudnn("fp8")
+    q, k, v = _make_qkv(1, 4, 4, 256, 256, 64, torch.device("cuda"))
+    scales = tuple(x.float().abs().amax().reshape(()) / 448.0 for x in (q, k, v))
+    quantized = tuple(
+        torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, scale)[0]
+        for x, scale in zip((q, k, v), scales)
+    )
+    attention = CuDNNAttention(
+        num_heads=4,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        quant_attention_config=QUANT_CONFIGS["fp8"],
+    )
+    static_scales = dict(zip(("static_q_scale", "static_k_scale", "static_v_scale"), scales))
+
+    prequantized_out = attention.forward(*quantized, **static_scales)
+    bf16_out = attention.forward(q, k, v, **static_scales)
+    torch.testing.assert_close(prequantized_out, bf16_out, atol=0, rtol=0)
+    ref_out, _ = _reference(q, k, v, is_causal=False)
+    cosine = F.cosine_similarity(prequantized_out.float().flatten(), ref_out.flatten(), dim=0)
+    assert cosine.item() > MIN_COSINE["fp8"]
+
+    with pytest.raises(ValueError, match="require static Q/K/V descales"):
+        attention.forward(*quantized)

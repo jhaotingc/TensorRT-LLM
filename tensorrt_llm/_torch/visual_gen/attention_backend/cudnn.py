@@ -97,6 +97,18 @@ def _quantize_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return x_q, descale.float().reshape(1, 1, 1, 1)
 
 
+def _quantize_fp8_static(
+    x: torch.Tensor, descale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Use a calibrated descale, preserving Q/K/V already quantized by FLUX."""
+    if descale.numel() != 1 or descale.dtype != torch.float32 or descale.device != x.device:
+        raise ValueError("Static FP8 descale must be one float32 value on the input device.")
+    if x.dtype == torch.float8_e4m3fn:
+        return x, descale.reshape(1, 1, 1, 1)
+    x_q, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x.contiguous(), descale)
+    return x_q, descale.reshape(1, 1, 1, 1)
+
+
 def _quantize_mxfp8_qk(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a Q or K tensor to MXFP8, blocking along the head dimension.
 
@@ -611,13 +623,25 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        static_q_scale: Optional[torch.Tensor] = None,
+        static_k_scale: Optional[torch.Tensor] = None,
+        static_v_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
         out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        static_scales = (static_q_scale, static_k_scale, static_v_scale)
+        has_static_scales = all(scale is not None for scale in static_scales)
+        if any(scale is not None for scale in static_scales) and not has_static_scales:
+            raise ValueError("Static cuDNN FP8 attention requires all Q/K/V descales.")
+        if has_static_scales and self.quant_dtype != "fp8":
+            raise ValueError("Static Q/K/V descales require cuDNN FP8 attention.")
+        if not has_static_scales and any(x.dtype == torch.float8_e4m3fn for x in (q, k, v)):
+            raise ValueError("Pre-quantized FP8 Q/K/V require static Q/K/V descales.")
+        if not has_static_scales:
+            q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
         # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
@@ -630,7 +654,11 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and self._is_fused_qkv(q, k, v):
+            if has_static_scales:
+                q_q, descale_q = _quantize_fp8_static(q, static_q_scale)
+                k_q, descale_k = _quantize_fp8_static(k, static_k_scale)
+                v_q, descale_v = _quantize_fp8_static(v, static_v_scale)
+            elif d_qk == d_v and self._is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
                 qkv_q, descale = _quantize_fp8(self._as_fused_qkv(q, k, v))
@@ -735,7 +763,14 @@ class CuDNNAttention(AttentionBackend):
             Output tensor ``[B, S_q, H, D_v]``.
         """
         output, _ = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
+            q,
+            k,
+            v,
+            is_causal=self._resolve_mask(attention_mask, key_padding_mask),
+            with_lse=False,
+            static_q_scale=kwargs.get("static_q_scale"),
+            static_k_scale=kwargs.get("static_k_scale"),
+            static_v_scale=kwargs.get("static_v_scale"),
         )
         return output
 
@@ -755,7 +790,14 @@ class CuDNNAttention(AttentionBackend):
             lse: ``[B, S_q, H]`` float32
         """
         output, lse = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
+            q,
+            k,
+            v,
+            is_causal=self._resolve_mask(attention_mask, key_padding_mask),
+            with_lse=True,
+            static_q_scale=kwargs.get("static_q_scale"),
+            static_k_scale=kwargs.get("static_k_scale"),
+            static_v_scale=kwargs.get("static_v_scale"),
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."
         return output, lse

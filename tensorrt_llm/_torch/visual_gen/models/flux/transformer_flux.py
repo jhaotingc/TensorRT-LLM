@@ -946,7 +946,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             missing = [key for key in scale_keys.values() if key not in weights]
             if missing:
                 raise ValueError(
-                    "Static CUTEDSL FP8 attention requires ModelOpt --quantize-mha "
+                    "Static FP8 attention requires ModelOpt --quantize-mha "
                     f"Q/K/V scales for {module_name}; missing keys: {missing}."
                 )
             module.load_static_e4m3_attention_scales(
