@@ -113,7 +113,7 @@ def find_backend_class(
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
     ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
-    exists and wins, so only bf16 tests are exercising a FlashInfer class.
+    exists and wins, except MXFP8, which is also FlashInfer-exclusive.
     Marlin has a single provider, so its lookup is keyed by quant alone.
 
     Absence is returned rather than raised so that a parameter generator can
@@ -452,6 +452,7 @@ def should_skip_trtllm(
     trtllm_gen_quant_algos = {
         QuantAlgo.NVFP4,
         QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.MXFP8,
         QuantAlgo.W4A8_NVFP4_FP8,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
@@ -824,6 +825,9 @@ def should_skip_cutlass(
             QuantAlgo.W4A8_AWQ,
             QuantAlgo.MXFP8,
         }
+        if backend_type == MoeBackendType.TRTLLM:
+            # FlashInfer MXFP8 pads physical buffers after logical TP slicing.
+            tp_alignment_quants.discard(QuantAlgo.MXFP8)
         # FP8_BLOCK_SCALES has this issue only on Hopper (SM90)
         if torch.cuda.get_device_capability(0) == (9, 0):
             tp_alignment_quants.add(QuantAlgo.FP8_BLOCK_SCALES)
@@ -1437,17 +1441,18 @@ def get_quick_skip_reason(
             is_intermediate_128_aligned = intermediate_size % 128 == 0
 
             if not is_hidden_128_aligned or not is_intermediate_128_aligned:
-                # TRTLLM with MXFP4 variants automatically pads to 128 alignment
-                is_mxfp4_variant = quant_algo in {
+                # TRTLLM with MXFP4/MXFP8 automatically pads physical buffers
+                has_padded_weights = quant_algo in {
+                    QuantAlgo.MXFP8,
                     QuantAlgo.W4A16_MXFP4,
                     QuantAlgo.W4A8_MXFP4_FP8,
                     QuantAlgo.W4A8_MXFP4_MXFP8,
                 }
                 is_trtllm_backend = backend_type == MoeBackendType.TRTLLM
-                if not (is_trtllm_backend and is_mxfp4_variant):
+                if not (is_trtllm_backend and has_padded_weights):
                     return (
                         f"Non-128-aligned sizes (h={hidden_size}, i={intermediate_size}) "
-                        f"require TRTLLM backend with MXFP4 quantization"
+                        f"require TRTLLM backend with MXFP4/MXFP8 quantization"
                     )
 
         return None

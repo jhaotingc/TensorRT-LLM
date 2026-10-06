@@ -34,7 +34,7 @@ of this file: the lookup is only correct once every leaf module has loaded.
 
 NVFP4, FP8_BLOCK_SCALES, W4A16_MXFP4 and W4A8_MXFP4_MXFP8 exist on both
 providers; W4A8_NVFP4_FP8 and W4A8_MXFP4_FP8 are native-only, and the
-unquantized bf16 path is FlashInfer-only.
+unquantized bf16 and MXFP8-weight paths are FlashInfer-only.
 """
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -54,6 +54,7 @@ from .eligibility import (
 )
 from .flashinfer_bf16 import FlashinferTrtllmGenBf16Impl
 from .flashinfer_fp8_block_scales import FlashinferTrtllmGenFp8BlockScalesImpl
+from .flashinfer_mxfp8 import FlashinferTrtllmGenMxfp8Impl
 from .flashinfer_nvfp4 import FlashinferTrtllmGenNvfp4Impl
 from .flashinfer_w4a8_mxfp4_mxfp8 import FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl
 from .flashinfer_w4a16_mxfp4 import FlashinferTrtllmGenW4a16Mxfp4Impl
@@ -173,6 +174,7 @@ __all__ = [
     "FlashinferTrtllmGenW4a16Mxfp4Impl",
     "FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl",
     "FlashinferTrtllmGenBf16Impl",
+    "FlashinferTrtllmGenMxfp8Impl",
     # shared layers
     "TrtllmGenFusedMoEBase",
     "TRTLLMGenFp4BlockScaleBase",

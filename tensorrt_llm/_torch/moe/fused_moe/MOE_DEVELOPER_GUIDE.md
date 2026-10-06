@@ -244,6 +244,7 @@ The package is self-contained, bottom to top:
 | `eligibility.py` | the eligibility checks each leaf's `can_implement` composes, as free functions — every caller is a leaf |
 | `kernel_inputs.py` | the `run_moe` prologue the kernel bodies share, as free functions taking the impl |
 | `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
+| `flashinfer_mxfp8.py` | FlashInfer-exclusive W8A8 MXFP8, separated routing, SwiGLU/ReLU2; weights and inputs padded internally to intermediate 128 / hidden 256; complete 32-element scale blocks per logical TP shard; no EPLB or expert bias |
 | `flashinfer_<quant>.py` | one registered FlashInfer leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `bf16` |
 
 #### The leaves
@@ -264,6 +265,7 @@ cells of the provider x format grid have no leaf.
 | `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` | — |
 | `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` | — |
 | `none` (BF16) | — | `FlashinferTrtllmGenBf16Impl` |
+| `mxfp8` | — | `FlashinferTrtllmGenMxfp8Impl` |
 
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
 `flashinfer.trtllm_gen.fused_moe.none`), keeping the technique and kernel
@@ -279,6 +281,11 @@ FlashInfer leaf asked for without the flag declines with `PATH_NOT_ENABLED`,
 which distinguishes "not chosen" from "not installed" (`DEP_MISSING`).
 `IMPL_PRIORITY` lists each FlashInfer leaf ahead of the native leaf of the same
 format, so the flag alone decides the order the two are asked in.
+`FlashinferTrtllmGenMxfp8Impl` is also outside that opt-in policy because no native
+MXFP8-weight leaf exists. It preserves logical dimensions, pads weight bytes
+with zero and UE8M0 scales with 127 before shuffling, and pads activations after
+dispatch then trims finalized output. `MXFP8TRTLLMGenFusedMoEMethod` owns
+weight loading and rejects partial loading and non-VANILLA checkpoints.
 `FlashinferTrtllmGenBf16Impl` is outside that policy — see the `§` footnote
 under [Quantization Support](#quantization-support).
 
@@ -514,7 +521,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | N | N | Y (SM100/103/107, requires `hidden_size % 512 == 0`) | N | N | N | N |
-| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103) | Y (SM100 family, FlashInfer, SwiGLU/ReLU2) | N | N | N | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |

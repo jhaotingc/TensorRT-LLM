@@ -99,6 +99,28 @@ class MoEOpBackend:
 
     # ==================== MoE Runner Operations ====================
 
+    def run_mxfp8_moe(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        activation: str,
+        tune_max_num_tokens: int,
+    ) -> torch.Tensor:
+        """Run MXFP8 with UE8M0 scales and precomputed routing."""
+        raise NotImplementedError
+
     def run_fp8_block_scale_moe(
         self,
         router_logits: Optional[torch.Tensor],
@@ -645,6 +667,51 @@ class FlashinferOpBackend(MoEOpBackend):
     ):
         return self._mxfp8_quantize(
             input, is_sf_swizzled_layout, alignment=alignment, enable_pdl=enable_pdl
+        )
+
+    def run_mxfp8_moe(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        activation: str,
+        tune_max_num_tokens: int,
+    ) -> torch.Tensor:
+        from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
+
+        return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
+            topk_ids=(topk_ids.to(torch.int32), topk_weights.to(torch.bfloat16)),
+            routing_bias=None,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=None,
+            use_shuffled_weight=True,
+            weight_layout=0,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=ActivationType[activation].value,
+            tune_max_num_tokens=tune_max_num_tokens,
         )
 
     # MoE Runners

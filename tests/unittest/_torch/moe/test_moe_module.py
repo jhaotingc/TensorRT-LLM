@@ -2224,3 +2224,55 @@ def test_configurable_moe_multi_gpu_eplb(
         model_config=model_config,
         routing_method_cls=routing_method_cls,
     )
+
+
+@pytest.mark.parametrize("hidden, intermediate", [(128, 928), (2688, 1856)])
+def test_trtllm_mxfp8_padded_relu2_module(hidden, intermediate):
+    """The factory and scheduler reach FlashInfer MXFP8 without provider flags."""
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import FlashinferTrtllmGenMxfp8Impl
+    from tensorrt_llm._utils import is_sm_100f
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    if not is_sm_100f(get_sm_version()):
+        pytest.skip("TRTLLM-Gen MXFP8 requires SM100 family")
+    cfg = ModelConfig(
+        pretrained_config=PretrainedConfig(dtype=torch.bfloat16),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    )
+    cfg.moe_backend = "TRTLLM"
+    with torch.device("cuda"):
+        moe = create_moe(
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            num_experts=4,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            dtype=torch.bfloat16,
+            model_config=cfg,
+            activation=SimpleActivation(ActivationType.Relu2),
+            allow_backend_degradation=False,
+        )
+    assert isinstance(moe.backend, FlashinferTrtllmGenMxfp8Impl)
+    weights = {}
+    for expert in range(4):
+        for leaf, shape in (("w1", (intermediate, hidden)), ("w2", (hidden, intermediate))):
+            weight = torch.zeros(shape, dtype=torch.float8_e4m3fn, device="cuda")
+            if leaf == "w1":
+                weight[:928, :128] = 1 / 64
+            else:
+                weight[:, :928] = 1 / 64
+            weights[f"{expert}.{leaf}.weight"] = weight
+            weights[f"{expert}.{leaf}.weight_scale"] = torch.full(
+                (shape[0], shape[1] // 32), 127, dtype=torch.uint8, device="cuda"
+            )
+        weights[f"{expert}.w3.weight"] = torch.empty(
+            (0, hidden), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+    moe.load_weights([weights])
+    x = torch.ones((8, hidden), dtype=torch.bfloat16, device="cuda")
+    logits = torch.zeros((8, 4), dtype=torch.float32, device="cuda")
+    actual = moe(x, logits)
+    # FC1=128/64=2, ReLU2=4, FC2=928*4/64=58; routing weights sum to one.
+    torch.testing.assert_close(actual, torch.full_like(x, 58), rtol=0, atol=0)

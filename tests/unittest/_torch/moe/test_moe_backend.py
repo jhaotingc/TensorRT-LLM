@@ -3330,3 +3330,159 @@ def test_unresolvable_layer_error_carries_rejection_details():
     )
     with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
         impl_class_for(report)
+
+
+@pytest.mark.parametrize(
+    "hidden, intermediate, activation",
+    [(128, 928, "Relu2"), (2688, 1856, "Relu2"), (256, 1024, "Relu2"), (256, 928, "Swiglu")],
+)
+def test_trtllm_mxfp8_padding_numerical(hidden, intermediate, activation):
+    """Unaligned checkpoint weights preserve the logical expert computation."""
+    from flashinfer import mxfp8_quantize
+
+    from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import FlashinferTrtllmGenMxfp8Impl
+
+    if not is_sm_100f(get_sm_version()):
+        pytest.skip("TRTLLM-Gen MXFP8 requires SM100 family")
+    torch.manual_seed(123)
+    e, topk, tokens = 4, 2, 8
+    cfg = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32))
+    cfg.moe_backend = "TRTLLM"
+    act = SimpleActivation(ActivationType.Relu2) if activation == "Relu2" else SwigluActivation()
+    with torch.device("cuda"):
+        backend = FlashinferTrtllmGenMxfp8Impl(
+            routing_method=RenormalizeMoeRoutingMethod(top_k=topk),
+            num_experts=e,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            dtype=torch.bfloat16,
+            model_config=cfg,
+            activation=act,
+        )
+    weights = {}
+
+    def quant(t):
+        q, sf = mxfp8_quantize(t.contiguous(), is_sf_swizzled_layout=False)
+        return q, sf.view(torch.uint8).reshape(t.shape[0], t.shape[1] // 32)
+
+    def dequant(q, sf):
+        return q.float() * torch.exp2(sf.float() - 127).repeat_interleave(32, dim=-1)
+
+    decoded = []
+    for expert in range(e):
+        tensors = {}
+        for leaf, shape in (
+            ("w1", (intermediate, hidden)),
+            ("w2", (hidden, intermediate)),
+            ("w3", (intermediate, hidden)),
+        ):
+            w = (torch.randn(shape, device="cuda") * 0.02).to(torch.bfloat16)
+            q, sf = quant(w)
+            weights[f"{expert}.{leaf}.weight"] = q
+            weights[f"{expert}.{leaf}.weight_scale"] = sf
+            tensors[leaf] = dequant(q, sf)
+        decoded.append(tensors)
+    backend.load_weights([weights])
+    assert backend.hidden_size == hidden
+    assert backend.intermediate_size_per_partition == intermediate
+    assert backend.w2_weight.shape == (
+        e,
+        ((hidden + 255) // 256) * 256,
+        ((intermediate + 127) // 128) * 128,
+    )
+    x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    ids = torch.tensor([[0, 1], [2, 3]] * 4, device="cuda", dtype=torch.int32)
+    scales = torch.tensor([[0.25, 0.75]] * tokens, device="cuda", dtype=torch.bfloat16)
+    context = MoERunContext(
+        x=x,
+        x_sf=None,
+        token_selected_experts=ids,
+        token_final_scales=scales,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    actual = backend.run_moe(context)
+    xq, xsf = quant(x)
+    xref = dequant(xq, xsf)
+    expected = torch.zeros_like(x, dtype=torch.float32)
+    for expert, tensors in enumerate(decoded):
+        if activation == "Relu2":
+            up = xref @ tensors["w1"].T
+            mid = torch.relu(up).square()
+        else:
+            # TRT-LLM's gated checkpoint keys: w1=gate, w3=up.
+            gate = xref @ tensors["w1"].T
+            up = xref @ tensors["w3"].T
+            mid = torch.nn.functional.silu(gate) * up
+        mq, msf = quant(mid.to(torch.bfloat16))
+        out = dequant(mq, msf) @ tensors["w2"].T
+        factor = (scales.float() * (ids == expert)).sum(dim=1)
+        expected += out * factor[:, None]
+    relative_rms = (
+        actual.float() - expected
+    ).square().mean().sqrt() / expected.square().mean().sqrt()
+    # The fused FC1 epilogue quantizes its accumulator directly; the dense
+    # reference materializes BF16 before requantization. Compare normalized
+    # error rather than elementwise relative error at near-zero outputs.
+    assert relative_rms < 0.06, relative_rms
+    assert torch.isfinite(actual).all()
+    assert (actual.float() - expected).abs().max() < 0.25 * expected.square().mean().sqrt()
+    # Reload writes canonical bytes before reshuffling; it must not shuffle twice.
+    backend.load_weights([weights])
+    torch.testing.assert_close(backend.run_moe(context), actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_trtllm_mxfp8_padding_preserves_logical_tp_shards(rank):
+    from tensorrt_llm._torch.moe.fused_moe.quantization import MXFP8TRTLLMGenFusedMoEMethod
+
+    module = torch.nn.Module()
+    for name, value in dict(
+        hidden_size=128,
+        intermediate_size_per_partition=928,
+        intermediate_size_expand_ratio=1,
+        expert_size_per_partition=1,
+        tp_size=2,
+        tp_rank=rank,
+        bias=False,
+        dtype=torch.bfloat16,
+        initial_local_expert_ids=[0],
+    ).items():
+        setattr(module, name, value)
+    method = MXFP8TRTLLMGenFusedMoEMethod()
+    method.create_weights(module)
+    w1 = (
+        torch.arange(1856 * 128)
+        .remainder(120)
+        .to(torch.uint8)
+        .reshape(1856, 128)
+        .view(torch.float8_e4m3fn)
+    )
+    w2 = w1.T.contiguous()
+    method.load_expert_w3_w1_weight(module, w1, None, module.w3_w1_weight.data[0])
+    method.load_expert_w2_weight(module, w2, module.w2_weight.data[0])
+    s1 = torch.arange(1856 * 4).remainder(20).add(117).to(torch.uint8).reshape(1856, 4)
+    s2 = torch.arange(128 * 58).remainder(20).add(117).to(torch.uint8).reshape(128, 58)
+    method.load_quant_scales(module, {"0.w1.weight_scale": s1, "0.w2.weight_scale_inv": s2})
+    start = rank * 928
+    torch.testing.assert_close(
+        module.w3_w1_weight[0, :928, :128].view(torch.uint8),
+        w1[start : start + 928].view(torch.uint8),
+    )
+    torch.testing.assert_close(
+        module.w2_weight[0, :128, :928].view(torch.uint8),
+        w2[:, start : start + 928].view(torch.uint8),
+    )
+    torch.testing.assert_close(module.w3_w1_weight_scale[0, :928, :4], s1[start : start + 928])
+    torch.testing.assert_close(
+        module.w2_weight_scale[0, :128, :29], s2[:, rank * 29 : (rank + 1) * 29]
+    )
+    assert not module.w3_w1_weight[0, 928:].view(torch.uint8).count_nonzero()
+    assert not module.w2_weight[0, :, 928:].view(torch.uint8).count_nonzero()
+    assert torch.all(module.w3_w1_weight_scale[0, 928:] == 127)
+    assert torch.all(module.w2_weight_scale[0, :, 29:] == 127)

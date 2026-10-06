@@ -34,6 +34,8 @@ class MoEDep(str, Enum):
     #: ``trtllm_bf16_routed_moe``. Strictly stronger than :attr:`FLASHINFER`
     #: and gates the TRTLLM-Gen unquantized BF16 path.
     FLASHINFER_BF16_MOE = "flashinfer_bf16_moe"
+    #: TRTLLM-Gen routed FP8 MoE exposes MXFP8 and activation selection.
+    FLASHINFER_MXFP8_MOE = "flashinfer_mxfp8_moe"
     #: The bundled DeepGEMM build exposes the ``fp8_fp4_mega_moe`` kernel.
     DEEPGEMM_MEGAMOE = "deepgemm_megamoe"
     #: ``nvidia-cutlass-dsl[cu13]`` is new enough for the MegaMoE CuteDSL ABI.
@@ -70,6 +72,23 @@ def _probe_flashinfer() -> Tuple[bool, str]:
         import flashinfer  # noqa: F401
     except Exception as exc:  # noqa: BLE001 - any import failure means absent
         return False, f"import flashinfer failed: {exc}"
+    return True, ""
+
+
+def _probe_flashinfer_mxfp8_moe() -> Tuple[bool, str]:
+    try:
+        import inspect
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
+        from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
+
+        if not hasattr(Fp8QuantizationType, "MxFp8") or not hasattr(ActivationType, "Relu2"):
+            return False, "FlashInfer lacks MXFP8 or ReLU2 enums"
+        params = inspect.signature(trtllm_fp8_block_scale_routed_moe).parameters
+        if "fp8_quantization_type" not in params or "activation_type" not in params:
+            return False, "FlashInfer routed FP8 MoE lacks quantization/activation selection"
+    except Exception as exc:  # noqa: BLE001 - older wheels lack this ABI
+        return False, f"FlashInfer MXFP8 MoE API unavailable: {exc}"
     return True, ""
 
 
@@ -133,6 +152,7 @@ def _probe_megamoe_cutedsl_op() -> Tuple[bool, str]:
 _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.FLASHINFER: _probe_flashinfer,
     MoEDep.FLASHINFER_BF16_MOE: _probe_flashinfer_bf16_moe,
+    MoEDep.FLASHINFER_MXFP8_MOE: _probe_flashinfer_mxfp8_moe,
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,

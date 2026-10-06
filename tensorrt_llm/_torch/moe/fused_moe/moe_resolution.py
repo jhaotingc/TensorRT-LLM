@@ -63,6 +63,7 @@ from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
     FlashinferTrtllmGenFp8BlockScalesImpl,
+    FlashinferTrtllmGenMxfp8Impl,
     FlashinferTrtllmGenNvfp4Impl,
     FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
     FlashinferTrtllmGenW4a16Mxfp4Impl,
@@ -106,7 +107,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
-    # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
+    # flag unset paired FlashInfer leaves reject in ``check_flashinfer_provider``
     # and resolution walks on to the native one below.
     #
     # Order within a provider does not matter: the ``quant`` segments are
@@ -116,6 +117,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     FlashinferTrtllmGenW4a16Mxfp4Impl,
     FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
     FlashinferTrtllmGenBf16Impl,  # no native counterpart; flag-independent
+    FlashinferTrtllmGenMxfp8Impl,  # FlashInfer-exclusive, flag-independent
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenW4a16Mxfp4Impl,
@@ -152,6 +154,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
             FlashinferTrtllmGenW4a16Mxfp4Impl,
             FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
             FlashinferTrtllmGenBf16Impl,
+            FlashinferTrtllmGenMxfp8Impl,
             TrtllmTrtllmGenNvfp4Impl,
             TrtllmTrtllmGenFp8BlockScalesImpl,
             TrtllmTrtllmGenW4a16Mxfp4Impl,

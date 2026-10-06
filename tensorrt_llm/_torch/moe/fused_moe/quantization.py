@@ -6532,6 +6532,174 @@ class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
         )
 
 
+def _get_mxfp8_scale_key(weights: Dict, expert_id: int,
+                         leaf: str) -> Optional[str]:
+    # Producers either ship `weight_scale_inv` (MiniMax M3 / DeepSeek-style)
+    # or `weight_scale`. Probe both.
+    for suffix in ("weight_scale_inv", "weight_scale"):
+        key = f"{expert_id}.{leaf}.{suffix}"
+        if key in weights:
+            return key
+    return None
+
+
+class MXFP8TRTLLMGenFusedMoEMethod(FusedMoEMethodBase):
+    """Padded, shuffled MajorK E4M3 weights with UE8M0 1x32 scales.
+
+    Slice logical TP shards before padding. Scale byte 127 represents one;
+    weight byte zero represents zero, so extra rows and columns contribute zero.
+    """
+    weight_alignment = 128
+    input_hidden_alignment = 256
+
+    def create_weights(self, module: torch.nn.Module) -> None:
+        self._online_eplb_not_supported(module)
+        if module.hidden_size % 32 or module.intermediate_size_per_partition % 32:
+            raise ValueError(
+                "MXFP8 requires complete 32-element scale blocks per TP shard")
+        n = ((module.intermediate_size_per_partition + 127) // 128) * 128
+        h = ((module.hidden_size + 255) // 256) * 256
+        logger.info_once(
+            f"MXFP8 MoE uses FlashInfer TRTLLM-Gen: hidden "
+            f"{module.hidden_size}->{h}, intermediate per TP shard "
+            f"{module.intermediate_size_per_partition}->{n}",
+            key=
+            f"trtllm_gen_mxfp8_{module.hidden_size}_{module.intermediate_size_per_partition}",
+        )
+        e = module.expert_size_per_partition
+        expansion = module.intermediate_size_expand_ratio
+        super().create_weights(module, torch.float8_e4m3fn,
+                               (e, expansion * n, h), (e, h, n))
+        for name, shape in (("w3_w1_weight_scale", (e, expansion * n, h // 32)),
+                            ("w2_weight_scale", (e, h, n // 32))):
+            module.register_parameter(
+                name,
+                nn.Parameter(torch.empty(shape,
+                                         dtype=torch.uint8,
+                                         device=module.w2_weight.device),
+                             requires_grad=False))
+        self.setup_quant_scales(module)
+
+    def setup_quant_scales(self, module: torch.nn.Module) -> None:
+        # This runner takes scale parameters directly, without a CUTLASS tuple.
+        module.quant_scales = None
+
+    @staticmethod
+    def _copy_padded(dst: torch.Tensor,
+                     src: torch.Tensor,
+                     fill: int = 0) -> None:
+        # Write float8 through byte views: padding must preserve payload bytes.
+        dst_bytes = dst.view(torch.uint8)
+        src_bytes = src.contiguous().view(torch.uint8)
+        dst_bytes.fill_(fill)
+        if src_bytes.shape[0] > dst_bytes.shape[0] or src_bytes.shape[
+                1] > dst_bytes.shape[1]:
+            raise ValueError(
+                f"MXFP8 source shape {src.shape} exceeds destination {dst.shape}"
+            )
+        dst_bytes[:src_bytes.shape[0], :src_bytes.shape[1]].copy_(src_bytes)
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor) -> None:
+        parts = dst_w3_w1_weight.chunk(
+            2, dim=0) if module.intermediate_size_expand_ratio == 2 else (
+                dst_w3_w1_weight, )
+        sources = (w3_weight, w1_weight) if len(parts) == 2 else (w1_weight, )
+        for dst, src in zip(parts, sources):
+            shard = load_weight_shard(src,
+                                      module.tp_size,
+                                      module.tp_rank,
+                                      TensorParallelMode.COLUMN,
+                                      device=dst.device)
+            self._copy_padded(dst, shard)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor) -> None:
+        shard = load_weight_shard(w2_weight,
+                                  module.tp_size,
+                                  module.tp_rank,
+                                  TensorParallelMode.ROW,
+                                  device=dst_w2_weight.device)
+        self._copy_padded(dst_w2_weight, shard)
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: Dict,
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False) -> None:
+        if weight_loading_mode != MoEWeightLoadingMode.VANILLA:
+            raise NotImplementedError(
+                "TRTLLM-Gen MXFP8 currently requires VANILLA expert weights")
+        super().load_weights(module, weights, weight_loading_mode,
+                             allow_partial_loading)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
+        for slot, expert in enumerate(module.initial_local_expert_ids):
+            fc1 = module.w3_w1_weight_scale.data[slot]
+            parts = fc1.chunk(
+                2, dim=0) if module.intermediate_size_expand_ratio == 2 else (
+                    fc1, )
+            leaves = ("w3", "w1") if len(parts) == 2 else ("w1", )
+            entries = [(leaf, dst, TensorParallelMode.COLUMN)
+                       for leaf, dst in zip(leaves, parts)]
+            entries.append(("w2", module.w2_weight_scale.data[slot],
+                            TensorParallelMode.ROW))
+            for leaf, dst, mode in entries:
+                key = _get_mxfp8_scale_key(weights, expert, leaf)
+                if key is None:
+                    raise ValueError(
+                        f"Missing MXFP8 scales for expert {expert}.{leaf}")
+                sf = weights[key].view(torch.uint8)
+                shard = load_weight_shard(sf,
+                                          module.tp_size,
+                                          module.tp_rank,
+                                          mode,
+                                          device=dst.device)
+                self._copy_padded(dst, shard, fill=127)
+
+    def process_weights_after_loading(self, module: torch.nn.Module) -> None:
+        if getattr(module, "_weights_transformed", False):
+            return
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache)
+        from flashinfer.quantization.fp4_quantization import \
+            block_scale_interleave
+
+        cache = {}
+        for expert in range(module.expert_size_per_partition):
+            for weight, scales, fc1 in ((module.w3_w1_weight,
+                                         module.w3_w1_weight_scale, True),
+                                        (module.w2_weight,
+                                         module.w2_weight_scale, False)):
+                w = weight.data[expert].view(torch.uint8)
+                sf = scales.data[expert]
+                if fc1:
+                    gated = module.intermediate_size_expand_ratio == 2
+                    wi = _maybe_get_cached_w3_w1_permute_indices(
+                        cache, w, 128, is_gated_act_gemm=gated)
+                    si = _maybe_get_cached_w3_w1_permute_indices(
+                        cache,
+                        sf,
+                        128,
+                        num_elts_per_sf=32,
+                        is_gated_act_gemm=gated)
+                else:
+                    wi = get_w2_permute_indices_with_cache(cache, w, 128)
+                    si = get_w2_permute_indices_with_cache(cache,
+                                                           sf,
+                                                           128,
+                                                           num_elts_per_sf=32)
+                w.copy_(w[wi.to(w.device)])
+                sf.copy_(
+                    block_scale_interleave(sf[si.to(
+                        sf.device)].contiguous()).reshape_as(sf))
+        module._weights_transformed = True
+
+
 class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32 block scales) x dynamic MXFP8 acts MoE.
 
@@ -6602,15 +6770,7 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             fc2_weight_block_scale=module.w2_weight_scale,
         )
 
-    @staticmethod
-    def _get_scale_key(weights, expert_id: int, leaf: str) -> Optional[str]:
-        # Producers either ship `weight_scale_inv` (MiniMax M3 / DeepSeek-style)
-        # or `weight_scale`. Probe both.
-        for suffix in ("weight_scale_inv", "weight_scale"):
-            key = f"{expert_id}.{leaf}.{suffix}"
-            if key in weights:
-                return key
-        return None
+    _get_scale_key = staticmethod(_get_mxfp8_scale_key)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         device = module.w3_w1_weight_scale.device

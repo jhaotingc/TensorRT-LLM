@@ -475,15 +475,15 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
 # TRTLLM-Gen implementation identity
 # =====================================================================
 # The one backend that does need the abstract parent the DeepGEMM section
-# below does without: eleven identities share one ``__init__``, one
+# below does without: twelve identities share one ``__init__``, one
 # ``create_weights`` and one input-preparation path. These tests pin the
 # split -- each leaf declares its own descriptor and all four abstract
 # methods, the parent declares neither, so no request can reach it.
 
 # The full grid, written out rather than generated, so a leaf that silently
 # stops registering fails here instead of shrinking a computed expectation.
-# Six native leaves; the FlashInfer wheel serves five of the seven formats --
-# it has no fp8/fp4-activation runner, and it alone has the unquantized one.
+# Six native leaves and six FlashInfer leaves; BF16 and MXFP8 are
+# FlashInfer-exclusive, while two W4A8 formats are native-only.
 _TRTLLM_GEN_IDS = (
     "trtllm.trtllm_gen.fused_moe.nvfp4",
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
@@ -496,6 +496,7 @@ _TRTLLM_GEN_IDS = (
     "flashinfer.trtllm_gen.fused_moe.w4a16_mxfp4",
     "flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
     "flashinfer.trtllm_gen.fused_moe.none",
+    "flashinfer.trtllm_gen.fused_moe.mxfp8",
 )
 
 
@@ -505,7 +506,11 @@ def _trtllm_gen_environment(
     """An SM100 host, with the FlashInfer wheel and its opt-in flag optional."""
     deps = []
     if flashinfer:
-        deps = [MoEDep.FLASHINFER.value, MoEDep.FLASHINFER_BF16_MOE.value]
+        deps = [
+            MoEDep.FLASHINFER.value,
+            MoEDep.FLASHINFER_BF16_MOE.value,
+            MoEDep.FLASHINFER_MXFP8_MOE.value,
+        ]
     return MoEEnvironment(
         sm=sm,
         available_deps=tuple(sorted(deps)),
@@ -534,8 +539,8 @@ def _trtllm_gen_model_config(quant_algo=QuantAlgo.NVFP4):
     return cfg
 
 
-def test_trtllm_gen_registers_exactly_eleven_identities():
-    """The grid is the deliverable: eleven addressable ids, no more, no fewer."""
+def test_trtllm_gen_registers_exactly_twelve_identities():
+    """The grid is the deliverable: twelve addressable ids, no more, no fewer."""
     registered = sorted(
         identity.canonical()
         for identity in MOE_IMPL_REGISTRY.identities()
@@ -549,7 +554,7 @@ def test_trtllm_gen_identity_round_trips_through_registry(impl_id):
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     assert impl is not None
     # Declared on the leaf itself, not inherited from the parent: an inherited
-    # descriptor would give eleven classes one identity.
+    # descriptor would give twelve classes one identity.
     assert "descriptor" in vars(impl)
     assert impl.descriptor.identity.canonical() == impl_id
     assert not impl.__abstractmethods__
@@ -780,6 +785,7 @@ _NO_EXPERT_BIAS_IDS = (
     "flashinfer.trtllm_gen.fused_moe.fp8_block_scales",
     "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
     "flashinfer.trtllm_gen.fused_moe.none",
+    "flashinfer.trtllm_gen.fused_moe.mxfp8",
 )
 
 
@@ -1320,3 +1326,51 @@ def test_an_identity_reusing_a_token_across_its_own_fields_is_rejected():
 
     with pytest.raises(ValueError, match=r"token 'torch' is already a value of field 'provider'"):
         registry.register(_SelfCollidingImpl)
+
+
+def test_trtllm_gen_mxfp8_is_flashinfer_exclusive_without_opt_in():
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import FlashinferTrtllmGenMxfp8Impl
+
+    cfg = _trtllm_gen_model_config(QuantAlgo.MXFP8)
+    with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
+        report = resolve_moe_impl(cfg)
+    assert impl_class_for(report) is FlashinferTrtllmGenMxfp8Impl
+    assert not report.degraded
+    assert not FlashinferTrtllmGenMxfp8Impl.capabilities.supports_eplb
+
+
+@pytest.mark.parametrize(
+    "hidden, intermediate, tp, eligible",
+    [(2688, 1856, 1, True), (2688, 1856, 2, True), (2689, 1856, 1, False), (2688, 1856, 4, False)],
+)
+def test_trtllm_gen_mxfp8_logical_shard_alignment(hidden, intermediate, tp, eligible):
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import FlashinferTrtllmGenMxfp8Impl
+
+    d = replace(_single_rank_deployment(_trtllm_gen_environment(flashinfer=True)), tp_size=tp)
+    p = MoEProblem(
+        quant="MXFP8",
+        dtype_act=torch.bfloat16,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation="Relu2",
+    )
+    assert FlashinferTrtllmGenMxfp8Impl.can_implement(p, d).eligible == eligible
+
+
+@pytest.mark.parametrize(
+    "changes, reason",
+    [
+        ({"eplb_enabled": True}, MoERejectReason.EPLB_UNSUPPORTED),
+        ({"fused_finalize_enabled": False}, MoERejectReason.FINALIZE_FUSION_REQUIRED),
+    ],
+)
+def test_trtllm_gen_mxfp8_rejects_unsupported_execution(changes, reason):
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import FlashinferTrtllmGenMxfp8Impl
+
+    d = replace(_single_rank_deployment(_trtllm_gen_environment(flashinfer=True)), **changes)
+    p = MoEProblem(quant="MXFP8", dtype_act=torch.bfloat16, activation="Relu2")
+    assert FlashinferTrtllmGenMxfp8Impl.can_implement(p, d).reject_reason is reason
