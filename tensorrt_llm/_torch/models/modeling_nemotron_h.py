@@ -1316,6 +1316,9 @@ class NemotronHMTP(nn.Module):
             sublayer_model_config = replace(model_config,
                                             quant_config=sublayer_quant_config,
                                             spec_config=None)
+            # extra_attrs is init=False; share the custom-op registries
+            # with the target model when constructing MTP sublayers.
+            sublayer_model_config.extra_attrs = model_config.extra_attrs
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,

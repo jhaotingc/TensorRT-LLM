@@ -256,6 +256,7 @@ def test_nemotron_h_mtp_sublayers_get_module_prefix_and_inherit_moe_backend():
     for sublayer_idx, layer_kwargs in enumerate(captured):
         assert layer_kwargs["module_prefix"] == f"model.layers.52.layers.{sublayer_idx}"
         assert layer_kwargs["model_config"].moe_backend == model_config.moe_backend
+        assert layer_kwargs["model_config"].extra_attrs is model_config.extra_attrs
     assert model_config.quant_config is quant_config
 
 
